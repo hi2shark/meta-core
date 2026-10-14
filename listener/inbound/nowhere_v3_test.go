@@ -412,6 +412,72 @@ func TestNowhereV3EgressBusy(t *testing.T) {
 	}
 }
 
+// TestCleanupReleasesNowhereEgress guards the shutdown path. An Egress holds a
+// live QUIC session to its Portal, and only closing the listener sends the
+// CONNECTION_CLOSE that releases the exit. Without it a stopped Egress leaves
+// the Portal's single exit pinned to a dead connection until the QUIC idle
+// timeout expires, so no replacement exit can register in the meantime.
+func TestCleanupReleasesNowhereEgress(t *testing.T) {
+	portalTunnel := newRecordingTunnel()
+	ownerTunnel := newRecordingTunnel()
+	waiterTunnel := newRecordingTunnel()
+
+	portal, err := inbound.NewNowhereV3(&inbound.NowhereOption{
+		BaseOption: nw3BaseOption(),
+		Password:   testNw3Key,
+		Version:    3,
+		Carrier:    "quic",
+		Egress:     true,
+	})
+	if err != nil {
+		t.Fatalf("NewNowhereV3 egress portal: %v", err)
+	}
+	if err := portal.Listen(portalTunnel); err != nil {
+		t.Fatalf("portal Listen: %v", err)
+	}
+	defer func() { _ = portal.Close() }()
+	portalPort := nw3PortalPort(t, portal.Address())
+
+	// Registered the way the config path registers it, so Cleanup can find it.
+	owner, err := inbound.NewNowhereEgress(&inbound.NowhereEgressOption{
+		BaseOption: inbound.BaseOption{NameStr: "nw3-egress-shutdown", Listen: "127.0.0.1", Port: "0"},
+		Server:     "127.0.0.1", Port: portalPort, Password: testNw3Key,
+		SkipCertVerify: true,
+	})
+	if err != nil {
+		t.Fatalf("NewNowhereEgress owner: %v", err)
+	}
+	listener.PatchInboundListeners(map[string]C.InboundListener{"nw3-egress-shutdown": owner}, ownerTunnel, false)
+	t.Cleanup(func() { _ = owner.Close() })
+
+	client, err := outbound.NewNowhereV3(outbound.NowhereOption{
+		Name: "nowhere-nw3-shutdown-client", Server: "127.0.0.1", Port: portalPort,
+		Password: testNw3Key, SkipCertVerify: true,
+		Version: 3, Carrier: "quic", UDP: true,
+	})
+	if err != nil {
+		t.Fatalf("NewNowhereV3 client: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	if err := echoOneFlow(t, client, ownerTunnel, "before shutdown"); err != nil {
+		t.Fatalf("flow before shutdown: %v", err)
+	}
+
+	listener.Cleanup()
+
+	// The exit must be free now: a fresh Egress registers without being told the
+	// exit is taken, and serves the next flow.
+	waiter, err := newNw3TestEgress(t, "nw3-egress-shutdown-waiter", portalPort, waiterTunnel)
+	if err != nil {
+		t.Fatalf("NewNowhereEgress waiter: %v", err)
+	}
+	defer func() { _ = waiter.Close() }()
+	if err := echoOneFlow(t, client, waiterTunnel, "after shutdown"); err != nil {
+		t.Fatalf("flow after shutdown: %v", err)
+	}
+}
+
 func newNw3TestEgress(t *testing.T, name string, portalPort int, tunnel *recordingTunnel) (*inbound.NowhereEgress, error) {
 	t.Helper()
 	egress, err := inbound.NewNowhereEgress(&inbound.NowhereEgressOption{
