@@ -7,7 +7,7 @@ import (
 	"strconv"
 
 	"github.com/metacubex/mihomo/transport/nowhere/core/internal/vectors"
-	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
+	"github.com/metacubex/mihomo/transport/nowhere/core/nw2/wire"
 )
 
 func checkMux(path string) (int, error) {

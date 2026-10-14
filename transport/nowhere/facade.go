@@ -6,9 +6,9 @@ package nowhere
 import (
 	"net/netip"
 
-	"github.com/metacubex/mihomo/transport/nowhere/core/bundle"
-	"github.com/metacubex/mihomo/transport/nowhere/core/carrier/tcptls"
-	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
+	"github.com/metacubex/mihomo/transport/nowhere/core/nw2/bundle"
+	"github.com/metacubex/mihomo/transport/nowhere/core/nw2/carrier/tcptls"
+	"github.com/metacubex/mihomo/transport/nowhere/core/nw2/wire"
 
 	quicpkg "github.com/metacubex/mihomo/transport/nowhere/carrier/quic"
 )

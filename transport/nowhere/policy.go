@@ -3,7 +3,7 @@ package nowhere
 import (
 	"fmt"
 
-	"github.com/metacubex/mihomo/transport/nowhere/core/bundle"
+	"github.com/metacubex/mihomo/transport/nowhere/core/nw2/bundle"
 )
 
 // RouteInputs is the host-facing carrier/mux/pool policy before it is mapped

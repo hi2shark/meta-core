@@ -5,7 +5,7 @@ import (
 	"net"
 	"net/netip"
 
-	"github.com/metacubex/mihomo/transport/nowhere/core/carrier/morph"
+	"github.com/metacubex/mihomo/transport/nowhere/core/nw2/carrier/morph"
 	"github.com/metacubex/mihomo/transport/tuic/common"
 )
 

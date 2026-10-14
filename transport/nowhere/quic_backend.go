@@ -4,7 +4,7 @@ import (
 	"context"
 	"net"
 
-	nquic "github.com/metacubex/mihomo/transport/nowhere/core/carrier/quic"
+	nquic "github.com/metacubex/mihomo/transport/nowhere/core/nw2/carrier/quic"
 
 	quicpkg "github.com/metacubex/mihomo/transport/nowhere/carrier/quic"
 )

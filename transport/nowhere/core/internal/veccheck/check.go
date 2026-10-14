@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/transport/nowhere/core/internal/vectors"
-	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
+	"github.com/metacubex/mihomo/transport/nowhere/core/nw2/wire"
 )
 
 // CheckDir validates all known vector files under dir. Returns the number of

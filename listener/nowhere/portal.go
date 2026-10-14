@@ -18,7 +18,7 @@ import (
 	nwtransport "github.com/metacubex/mihomo/transport/nowhere"
 	"github.com/metacubex/mihomo/transport/vmess"
 
-	nwserver "github.com/metacubex/mihomo/transport/nowhere/core/server"
+	nwserver "github.com/metacubex/mihomo/transport/nowhere/core/nw2/server"
 
 	"github.com/metacubex/quic-go"
 	"github.com/metacubex/tls"

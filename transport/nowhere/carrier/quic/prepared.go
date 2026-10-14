@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/contextutils"
-	nquic "github.com/metacubex/mihomo/transport/nowhere/core/carrier/quic"
+	nquic "github.com/metacubex/mihomo/transport/nowhere/core/nw2/carrier/quic"
 
 	"github.com/metacubex/quic-go"
 )

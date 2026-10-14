@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/transport/tuic/common"
-	nquic "github.com/metacubex/mihomo/transport/nowhere/core/carrier/quic"
-	"github.com/metacubex/mihomo/transport/nowhere/core/diagnostic"
-	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
+	nquic "github.com/metacubex/mihomo/transport/nowhere/core/nw2/carrier/quic"
+	"github.com/metacubex/mihomo/transport/nowhere/core/nw2/diagnostic"
+	"github.com/metacubex/mihomo/transport/nowhere/core/nw2/wire"
 
 	"github.com/metacubex/quic-go"
 )
