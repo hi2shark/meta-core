@@ -48,9 +48,9 @@ func (t *countingTunnel) HandleUDPPacket(packet C.UDPPacket, _ *C.Metadata) {
 func (t *countingTunnel) calls() int32 { return t.tcp.Load() + t.udp.Load() }
 
 // startRelayServer builds a relay Portal through the public inbound schema
-// (NowhereOption -> NewNowhere -> Listen) with a next section pointing at the
+// (NowhereOption -> NewNowhereV2 -> Listen) with a next section pointing at the
 // origin Portal: every inbound flow forwards to the origin (native Portal
-// chaining, Nowhere 1.7). up/down/pin configure the next hop towards the
+// chaining). up/down/pin configure the next hop towards the
 // origin; an empty up/down pair exercises the udp/udp default.
 func startRelayServer(t *testing.T, originPort int, up, down, pin string) (int, *countingTunnel) {
 	return startRelayServerOpt(t, originPort, up, down, pin, nil, nil)
@@ -59,7 +59,7 @@ func startRelayServer(t *testing.T, originPort int, up, down, pin string) (int, 
 func startRelayServerOpt(t *testing.T, originPort int, up, down, pin string, morph *bool, nextMorph *bool) (int, *countingTunnel) {
 	t.Helper()
 	tunnel := &countingTunnel{}
-	relay, err := IN.NewNowhere(&IN.NowhereOption{
+	relay, err := IN.NewNowhereV2(&IN.NowhereOption{
 		BaseOption:           IN.BaseOption{NameStr: "nowhere-test-relay", Listen: "127.0.0.1", Port: "0"},
 		Password:             testPassword,
 		Certificate:          testCertificate,
@@ -78,7 +78,7 @@ func startRelayServerOpt(t *testing.T, originPort int, up, down, pin string, mor
 		},
 	})
 	if err != nil {
-		t.Fatalf("inbound.NewNowhere with next: %v", err)
+		t.Fatalf("inbound.NewNowhereV2 with next: %v", err)
 	}
 	if err := relay.Listen(tunnel); err != nil {
 		t.Fatalf("relay Listen: %v", err)
@@ -112,9 +112,10 @@ func assertTunnelUnused(t *testing.T, tunnel *countingTunnel) {
 // accepted as an alias for an omitted sni/pin.
 func TestNowhereNextValidation(t *testing.T) {
 	newNowhere := func(next *IN.NowhereNextOption) error {
-		_, err := IN.NewNowhere(&IN.NowhereOption{
+		_, err := IN.NewNowhereV2(&IN.NowhereOption{
 			BaseOption: IN.BaseOption{NameStr: "nowhere-test-validation", Listen: "127.0.0.1", Port: "0"},
 			Password:   testPassword,
+			ALPN:       []string{"nw2"},
 			Next:       next,
 		})
 		return err
@@ -163,12 +164,12 @@ func TestNowhereNextValidation(t *testing.T) {
 			err := newNowhere(next)
 			if tc.wantErr == "" {
 				if err != nil {
-					t.Fatalf("NewNowhere: %v, want success", err)
+					t.Fatalf("NewNowhereV2: %v, want success", err)
 				}
 				return
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("NewNowhere error = %v, want substring %q", err, tc.wantErr)
+				t.Fatalf("NewNowhereV2 error = %v, want substring %q", err, tc.wantErr)
 			}
 		})
 	}
@@ -178,7 +179,7 @@ func intPointer(value int) *int { return &value }
 
 func boolPointer(value bool) *bool { return &value }
 
-// TestNowhereInboundChain verifies native Portal chaining (Nowhere 1.7): the
+// TestNowhereInboundChain verifies native Portal chaining: the
 // client opens flows to the relay Portal, which forwards them through the
 // origin Portal (the relay initializes the HOPS budget) before the origin's
 // tunnel upstream echoes them back. Both the client and next-hop side run all
@@ -235,13 +236,13 @@ func TestNowhereInboundMux(t *testing.T) {
 	muxOne := 1
 
 	t.Run("client mux tcp/tcp", func(t *testing.T) {
-		client, err := outbound.NewNowhere(outbound.NowhereOption{
+		client, err := outbound.NewNowhereV2(outbound.NowhereOption{
 			Name: "nowhere-test-mux", Server: "127.0.0.1", Port: originPort,
-			Password: testPassword, SkipCertVerify: true,
+			Password: testPassword, SkipCertVerify: true, ALPN: []string{"nw2"},
 			Up: "tcp", Down: "tcp", Mux: &muxOne, UDP: true,
 		})
 		if err != nil {
-			t.Fatalf("NewNowhere mux: %v", err)
+			t.Fatalf("NewNowhereV2 mux: %v", err)
 		}
 		t.Cleanup(func() { _ = client.Close() })
 		testTCPEcho(t, client)
@@ -251,22 +252,22 @@ func TestNowhereInboundMux(t *testing.T) {
 	// mix is a client carrier policy that Nowhere 2.2 dropped: the client
 	// bundle no longer resolves it, so the outbound must reject it.
 	t.Run("client mix/mix rejected", func(t *testing.T) {
-		_, err := outbound.NewNowhere(outbound.NowhereOption{
+		_, err := outbound.NewNowhereV2(outbound.NowhereOption{
 			Name: "nowhere-test-mix", Server: "127.0.0.1", Port: originPort,
-			Password: testPassword, SkipCertVerify: true,
+			Password: testPassword, SkipCertVerify: true, ALPN: []string{"nw2"},
 			Up: "mix", Down: "mix", UDP: true,
 		})
 		if err == nil {
-			t.Fatal("NewNowhere mix/mix: want error")
+			t.Fatal("NewNowhereV2 mix/mix: want error")
 		}
 		if !strings.Contains(err.Error(), "must be tcp or udp") {
-			t.Fatalf("NewNowhere mix/mix error = %v, want \"must be tcp or udp\"", err)
+			t.Fatalf("NewNowhereV2 mix/mix error = %v, want \"must be tcp or udp\"", err)
 		}
 	})
 
 	t.Run("next mux tcp/tcp", func(t *testing.T) {
 		tunnel := &countingTunnel{}
-		relay, err := IN.NewNowhere(&IN.NowhereOption{
+		relay, err := IN.NewNowhereV2(&IN.NowhereOption{
 			BaseOption:           IN.BaseOption{NameStr: "nowhere-test-relay-mux", Listen: "127.0.0.1", Port: "0"},
 			Password:             testPassword,
 			Certificate:          testCertificate,
@@ -279,7 +280,7 @@ func TestNowhereInboundMux(t *testing.T) {
 			},
 		})
 		if err != nil {
-			t.Fatalf("inbound.NewNowhere mux next: %v", err)
+			t.Fatalf("inbound.NewNowhereV2 mux next: %v", err)
 		}
 		if err := relay.Listen(tunnel); err != nil {
 			t.Fatalf("relay Listen: %v", err)
@@ -300,7 +301,7 @@ func TestNowhereInboundMux(t *testing.T) {
 	})
 
 	t.Run("next mix/mix rejected", func(t *testing.T) {
-		_, err := IN.NewNowhere(&IN.NowhereOption{
+		_, err := IN.NewNowhereV2(&IN.NowhereOption{
 			BaseOption:  IN.BaseOption{NameStr: "nowhere-test-relay-mix", Listen: "127.0.0.1", Port: "0"},
 			Password:    testPassword,
 			Certificate: testCertificate,
@@ -312,10 +313,10 @@ func TestNowhereInboundMux(t *testing.T) {
 			},
 		})
 		if err == nil {
-			t.Fatal("inbound.NewNowhere next mix/mix: want error")
+			t.Fatal("inbound.NewNowhereV2 next mix/mix: want error")
 		}
 		if !strings.Contains(err.Error(), "must be tcp or udp") {
-			t.Fatalf("inbound.NewNowhere next mix/mix error = %v, want \"must be tcp or udp\"", err)
+			t.Fatalf("inbound.NewNowhereV2 next mix/mix error = %v, want \"must be tcp or udp\"", err)
 		}
 	})
 
@@ -324,15 +325,16 @@ func TestNowhereInboundMux(t *testing.T) {
 	// characters after URL percent decoding.
 	t.Run("portal key admission", func(t *testing.T) {
 		for _, key := range []string{"secret", "NOWHERETESTSECRETNOWHERETESTSEC", "0123456789abcdef0123456789abcde", "0123456789abcdef0123456789abcdefg", " 0123456789abcdef0123456789abcd"} {
-			_, err := IN.NewNowhere(&IN.NowhereOption{
+			_, err := IN.NewNowhereV2(&IN.NowhereOption{
 				BaseOption: IN.BaseOption{NameStr: "nowhere-test-key", Listen: "127.0.0.1", Port: "0"},
 				Password:   key,
+				ALPN:       []string{"nw2"},
 			})
 			if err == nil {
-				t.Fatalf("NewNowhere password %q: want error", key)
+				t.Fatalf("NewNowhereV2 password %q: want error", key)
 			}
 			if !strings.Contains(err.Error(), "lowercase hexadecimal") {
-				t.Fatalf("NewNowhere password %q error = %v, want the shared-key rule", key, err)
+				t.Fatalf("NewNowhereV2 password %q error = %v, want the shared-key rule", key, err)
 			}
 		}
 		// Odd lengths inside the range are accepted (Nowhere 2.2.1).
@@ -341,35 +343,38 @@ func TestNowhereInboundMux(t *testing.T) {
 			"0123456789abcdef0123456789abcdef0",
 			"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		} {
-			if _, err := IN.NewNowhere(&IN.NowhereOption{
+			if _, err := IN.NewNowhereV2(&IN.NowhereOption{
 				BaseOption: IN.BaseOption{NameStr: "nowhere-test-key", Listen: "127.0.0.1", Port: "0"},
 				Password:   key,
+				ALPN:       []string{"nw2"},
 			}); err != nil {
-				t.Fatalf("NewNowhere password %q: %v", key, err)
+				t.Fatalf("NewNowhereV2 password %q: %v", key, err)
 			}
 		}
 		// A percent-encoded key decodes to the key text.
-		if _, err := IN.NewNowhere(&IN.NowhereOption{
+		if _, err := IN.NewNowhereV2(&IN.NowhereOption{
 			BaseOption: IN.BaseOption{NameStr: "nowhere-test-key", Listen: "127.0.0.1", Port: "0"},
 			Password:   "%30" + "123456789abcdef0123456789abcdef",
+			ALPN:       []string{"nw2"},
 		}); err != nil {
-			t.Fatalf("NewNowhere percent-encoded password: %v", err)
+			t.Fatalf("NewNowhereV2 percent-encoded password: %v", err)
 		}
 		// The next hop obeys the same rule.
-		_, err := IN.NewNowhere(&IN.NowhereOption{
+		_, err := IN.NewNowhereV2(&IN.NowhereOption{
 			BaseOption: IN.BaseOption{NameStr: "nowhere-test-key", Listen: "127.0.0.1", Port: "0"},
 			Password:   testPassword,
+			ALPN:       []string{"nw2"},
 			Next:       &IN.NowhereNextOption{Server: "origin.example", Port: 2080, Password: "short"},
 		})
 		if err == nil || !strings.Contains(err.Error(), "next: password") {
-			t.Fatalf("NewNowhere next password error = %v, want the shared-key rule", err)
+			t.Fatalf("NewNowhereV2 next password error = %v, want the shared-key rule", err)
 		}
 	})
 }
 
 func TestNowhereInboundChainMorph(t *testing.T) {
 	on := true
-	originPort := startTestServerConfig(t, LC.NowhereServer{
+	originPort := startTestServerConfig(t, LC.NowhereServerV2{
 		Enable:               true,
 		Listen:               "127.0.0.1:0",
 		Password:             testPassword,

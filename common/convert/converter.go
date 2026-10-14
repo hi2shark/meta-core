@@ -780,10 +780,15 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				nowhere["sni"] = sni
 			}
 			if alpns, present := query["alpn"]; present {
-				if len(alpns) != 1 || alpns[0] == "" || len(alpns[0]) > 255 || strings.Contains(alpns[0], ",") {
+				if len(alpns) != 1 || alpns[0] != "nw2" {
+					log.Warnln("nowhere share-link: alpn must be nw2")
 					continue
 				}
-				nowhere["alpn"] = []string{alpns[0]}
+				nowhere["alpn"] = []string{"nw2"}
+			} else {
+				// The nowhere:// share link is the Nowhere 2 matrix. An omitted
+				// ALPN would otherwise select Nowhere 3, which rejects up/down.
+				nowhere["alpn"] = []string{"nw2"}
 			}
 			if pool := query.Get("pool"); pool != "" && tcpTCP {
 				parsed, err := strconv.Atoi(pool)

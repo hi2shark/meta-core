@@ -47,7 +47,7 @@ type NowhereEgress struct {
 	*Base
 	config *NowhereEgressOption
 	ts     LC.NowhereEgress
-	e      *nowhere.EgressV3
+	e      *nowhere.Egress
 }
 
 // NewNowhereEgress builds the Nowhere 3 Egress inbound. The shared key must be
@@ -56,7 +56,7 @@ func NewNowhereEgress(options *NowhereEgressOption) (*NowhereEgress, error) {
 	if options.Password == "" {
 		return nil, fmt.Errorf("nowhere-egress %s: missing password", options.Name())
 	}
-	if err := nwtransport.ValidateNowhereV3ServiceKey(options.Password); err != nil {
+	if err := nwtransport.ValidateNowhereServiceKey(options.Password); err != nil {
 		return nil, fmt.Errorf("nowhere-egress %s: %w", options.Name(), err)
 	}
 	if options.Server == "" {
@@ -97,7 +97,7 @@ func NewNowhereEgress(options *NowhereEgressOption) (*NowhereEgress, error) {
 			SkipCertVerify:       options.SkipCertVerify,
 			CongestionController: options.CongestionController,
 			CWND:                 options.CWND,
-			Morph:                nwtransport.ResolveNowhereMorph(options.Morph, nwtransport.NowhereVersion3),
+			Morph:                nwtransport.ResolveNowhereMorph(options.Morph, true),
 		},
 	}, nil
 }
@@ -116,7 +116,7 @@ func (n *NowhereEgress) Address() string {
 // Listen implements constant.InboundListener. It starts the registration loop;
 // the loop owns one registration at a time and reconnects after a drop.
 func (n *NowhereEgress) Listen(tunnel C.Tunnel) error {
-	e, err := nowhere.NewEgressV3(context.Background(), n.ts, tunnel, n.Additions()...)
+	e, err := nowhere.NewEgress(context.Background(), n.ts, tunnel, n.Additions()...)
 	if err != nil {
 		return err
 	}

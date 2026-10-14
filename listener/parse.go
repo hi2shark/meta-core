@@ -163,21 +163,17 @@ func ParseListener(mapping map[string]any) (C.InboundListener, error) {
 		if err != nil {
 			return nil, err
 		}
-		// The version is resolved here so an unsupported value fails with the
-		// listener's own message before the nw2-only defaults above are applied.
-		version, versionErr := nwtransport.ResolveNowhereVersion(nowhereOption.Version)
-		if versionErr != nil {
-			return nil, fmt.Errorf("nowhere %s: %w", nowhereOption.Name(), versionErr)
+		// An omitted ALPN, or a single nw3, is Nowhere 3. Exactly nw2 is the
+		// Nowhere 2 compatibility stack. Any other name is rejected. An omitted
+		// value is not rewritten to nw2.
+		nw3, stackErr := nwtransport.SelectNowhereStack(nowhereOption.ALPN)
+		if stackErr != nil {
+			return nil, fmt.Errorf("nowhere %s: %w", nowhereOption.Name(), stackErr)
 		}
-		if version == nwtransport.NowhereVersion3 {
-			listener, err = IN.NewNowhereV3(nowhereOption)
-		} else {
-			// The nw2 ALPN default is applied after the decode (and only on the
-			// nw2 path) so the nw3 validator never sees it: nw3 fixes alpn.
-			if len(nowhereOption.ALPN) == 0 {
-				nowhereOption.ALPN = []string{"nw2"}
-			}
+		if nw3 {
 			listener, err = IN.NewNowhere(nowhereOption)
+		} else {
+			listener, err = IN.NewNowhereV2(nowhereOption)
 		}
 	case "nowhere-egress":
 		nowhereEgressOption := &IN.NowhereEgressOption{}

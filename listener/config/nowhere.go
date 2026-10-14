@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 )
 
-type NowhereServer struct {
+type NowhereServerV2 struct {
 	Enable               bool     `yaml:"enable" json:"enable"`
 	Listen               string   `yaml:"listen" json:"listen"`
 	Password             string   `yaml:"password" json:"password"`
@@ -16,15 +16,15 @@ type NowhereServer struct {
 	CWND                 int      `yaml:"cwnd" json:"cwnd,omitempty"`
 	// Morph enables the Nowhere 2 keyed socket transform below TLS/QUIC
 	// (official CLI morph=1). There is no negotiation: the peer must match.
-	Morph bool         `yaml:"morph" json:"morph,omitempty"`
-	Next  *NowhereNext `yaml:"next" json:"next,omitempty"`
+	Morph bool           `yaml:"morph" json:"morph,omitempty"`
+	Next  *NowhereNextV2 `yaml:"next" json:"next,omitempty"`
 }
 
-// NowhereNext is the next-hop Portal for native Portal chaining (Nowhere 1.7+):
-// when set, the listener forwards every inbound flow to another Nowhere Portal
-// instead of the tunnel. The forwarding connection inherits the listener ALPN
-// and congestion-controller/cwnd.
-type NowhereNext struct {
+// NowhereNextV2 is the next-hop Portal for native Portal chaining: when set,
+// the listener forwards every inbound flow to another Nowhere 2 Portal instead
+// of the tunnel. The forwarding connection inherits the listener ALPN and
+// congestion-controller/cwnd. The next Portal must run Nowhere 2.
+type NowhereNextV2 struct {
 	Server   string `yaml:"server" json:"server"`
 	Port     int    `yaml:"port" json:"port"`
 	Password string `yaml:"password" json:"password"`
@@ -59,16 +59,16 @@ type NowhereNext struct {
 	Morph bool `yaml:"morph" json:"morph,omitempty"`
 }
 
-func (n NowhereServer) String() string {
+func (n NowhereServerV2) String() string {
 	b, _ := json.Marshal(n)
 	return string(b)
 }
 
-// NowhereServerV3 is the Nowhere 3 (nw3) Portal listener configuration. The
+// NowhereServer is the Nowhere 3 (nw3) Portal listener configuration. The
 // vendored Portal owns its own handshake, so — unlike the Nowhere 2 server —
 // there is no next-hop chaining, no ECH key and no admission-limit knob: ALPN
 // is pinned to nw3 and TLS to 1.3.
-type NowhereServerV3 struct {
+type NowhereServer struct {
 	Enable               bool   `yaml:"enable" json:"enable"`
 	Listen               string `yaml:"listen" json:"listen"`
 	Password             string `yaml:"password" json:"password"`
@@ -76,19 +76,20 @@ type NowhereServerV3 struct {
 	PrivateKey           string `yaml:"private-key" json:"private-key"`
 	CongestionController string `yaml:"congestion-controller" json:"congestion-controller,omitempty"`
 	CWND                 int    `yaml:"cwnd" json:"cwnd,omitempty"`
-	// Carrier is the single Nowhere 3 transport: tcp (TLS over TCP) or quic.
-	Carrier string `yaml:"carrier" json:"carrier,omitempty"`
+	// Net is the single Nowhere 3 transport: tcp (TLS over TCP) or udp (QUIC).
+	Net string `yaml:"net" json:"net,omitempty"`
 	// Egress turns the Portal into an exit bridge: it accepts a single Egress
 	// registration over QUIC (see NowhereEgress) and forwards every
-	// authenticated flow there instead of to the local tunnel. It requires the
-	// quic carrier, because the registration handshake only exists there.
+	// authenticated flow there instead of to the local tunnel. It requires
+	// net udp, because the registration handshake only exists there.
 	Egress bool `yaml:"egress" json:"egress,omitempty"`
 	// Morph enables the Nowhere 3 keyed transform below TLS/QUIC. The inbound
-	// option layer resolves the per-version default (off for 2, on for 3).
+	// option layer resolves the per-stack default (off for Nowhere 2, on for
+	// Nowhere 3).
 	Morph bool `yaml:"morph" json:"morph,omitempty"`
 }
 
-func (n NowhereServerV3) String() string {
+func (n NowhereServer) String() string {
 	b, _ := json.Marshal(n)
 	return string(b)
 }

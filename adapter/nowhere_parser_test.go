@@ -8,12 +8,13 @@ import (
 // TestParseNowhereProxy drives the public ParseProxy entry point to confirm the
 // "nowhere" type is wired into the registry and produces a C.Nowhere proxy.
 func TestParseNowhereProxy(t *testing.T) {
+	// An omitted ALPN selects Nowhere 3, which requires a 32-hex key.
 	mapping := map[string]any{
 		"type":     "nowhere",
 		"name":     "nw",
 		"server":   "example.com",
 		"port":     2077,
-		"password": "secret",
+		"password": "0123456789abcdef0123456789abcdef",
 	}
 	proxy, err := ParseProxy(mapping)
 	if err != nil {
@@ -25,14 +26,21 @@ func TestParseNowhereProxy(t *testing.T) {
 	if !proxy.SupportUDP() {
 		t.Fatalf("SupportUDP = false, want true when udp key omitted")
 	}
+	if _, err := ParseProxy(map[string]any{
+		"type": "nowhere", "name": "nw", "server": "example.com",
+		"port": 2077, "password": "secret",
+	}); err == nil {
+		t.Fatal("ParseProxy accepted a non-32-hex key on the default Nowhere 3 stack")
+	}
 
-	// up/down select the carrier matrix and must be set together.
+	// up/down select the Nowhere 2 carrier matrix and require alpn nw2.
 	upDownMapping := map[string]any{
 		"type":     "nowhere",
 		"name":     "nw-tcp",
 		"server":   "example.com",
 		"port":     2077,
 		"password": "secret",
+		"alpn":     []string{"nw2"},
 		"up":       "tcp",
 		"down":     "tcp",
 	}
@@ -43,7 +51,8 @@ func TestParseNowhereProxy(t *testing.T) {
 	// An unknown carrier value must be rejected at parse time.
 	badMapping := map[string]any{
 		"type": "nowhere", "name": "nw", "server": "example.com",
-		"port": 2077, "password": "secret", "up": "carrier-pigeon", "down": "udp",
+		"port": 2077, "password": "secret", "alpn": []string{"nw2"},
+		"up": "carrier-pigeon", "down": "udp",
 	}
 	if _, err := ParseProxy(badMapping); err == nil {
 		t.Fatalf("ParseProxy accepted invalid carrier")
@@ -69,7 +78,7 @@ func TestParseNowhereProxy(t *testing.T) {
 
 	udpDisabledMapping := map[string]any{
 		"type": "nowhere", "name": "nw", "server": "example.com",
-		"port": 2077, "password": "secret", "udp": false,
+		"port": 2077, "password": "0123456789abcdef0123456789abcdef", "udp": false,
 	}
 	udpDisabled, err := ParseProxy(udpDisabledMapping)
 	if err != nil {
@@ -81,7 +90,8 @@ func TestParseNowhereProxy(t *testing.T) {
 
 	mixMapping := map[string]any{
 		"type": "nowhere", "name": "nw-mix", "server": "example.com",
-		"port": 2077, "password": "secret", "up": "mix", "down": "mix", "mux": 1,
+		"port": 2077, "password": "secret", "alpn": []string{"nw2"},
+		"up": "mix", "down": "mix", "mux": 1,
 	}
 	// mix is not a carrier since Nowhere 2.2: up/down must be tcp or udp.
 	if _, err := ParseProxy(mixMapping); err == nil {
@@ -92,9 +102,21 @@ func TestParseNowhereProxy(t *testing.T) {
 
 	morphMapping := map[string]any{
 		"type": "nowhere", "name": "nw-morph", "server": "example.com",
-		"port": 2077, "password": "secret", "morph": 1,
+		"port": 2077, "password": "secret", "alpn": []string{"nw2"}, "morph": 1,
 	}
 	if _, err := ParseProxy(morphMapping); err != nil {
 		t.Fatalf("ParseProxy morph: %v", err)
+	}
+	if _, err := ParseProxy(map[string]any{
+		"type": "nowhere", "name": "nw-net", "server": "example.com",
+		"port": 2077, "password": "secret", "alpn": []string{"nw2"}, "net": "udp",
+	}); err == nil {
+		t.Fatal("ParseProxy accepted net on the Nowhere 2 stack")
+	}
+	if _, err := ParseProxy(map[string]any{
+		"type": "nowhere", "name": "nw-quic", "server": "example.com",
+		"port": 2077, "password": "0123456789abcdef0123456789abcdef", "net": "quic",
+	}); err == nil {
+		t.Fatal("ParseProxy accepted net quic")
 	}
 }

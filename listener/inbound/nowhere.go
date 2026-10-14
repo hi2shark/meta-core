@@ -3,8 +3,6 @@ package inbound
 import (
 	"errors"
 	"fmt"
-	"net/netip"
-	"net/url"
 	"strings"
 
 	C "github.com/metacubex/mihomo/constant"
@@ -14,133 +12,27 @@ import (
 	nwtransport "github.com/metacubex/mihomo/transport/nowhere"
 )
 
-type NowhereOption struct {
-	BaseOption
-	Password             string   `inbound:"password"`
-	Certificate          string   `inbound:"certificate,omitempty"`
-	PrivateKey           string   `inbound:"private-key,omitempty"`
-	EchKey               string   `inbound:"ech-key,omitempty"`
-	ALPN                 []string `inbound:"alpn,omitempty"`
-	CongestionController string   `inbound:"congestion-controller,omitempty"`
-	CWND                 int      `inbound:"cwnd,omitempty"`
-	// Morph enables the Nowhere 2 keyed socket transform below TLS/QUIC
-	// (official CLI morph=1). YAML true/1 enable it; omitted/false/0 is morph=0.
-	// There is no negotiation: the client must use the same setting. Nowhere 3
-	// defaults the other way (on when omitted) — see ResolveNowhereMorph.
-	Morph *bool              `inbound:"morph,omitempty"`
-	Next  *NowhereNextOption `inbound:"next,omitempty"`
-
-	// Version selects the Nowhere protocol stack: 2 (default, the listener in
-	// listener/nowhere/server.go) or 3 (listener/nowhere/v3.go). An omitted
-	// value resolves to 2 so every pre-nw3 configuration keeps working
-	// unchanged.
-	Version int `inbound:"version,omitempty"`
-	// Carrier is the single Nowhere 3 transport: "tcp" (TLS over TCP, default)
-	// or "quic". It only applies to version 3.
-	Carrier string `inbound:"carrier,omitempty"`
-	// Egress turns the Nowhere 3 Portal into an exit bridge: it accepts a single
-	// Egress registration (see the nowhere-egress inbound) and forwards every
-	// authenticated flow there instead of to the local tunnel. It requires
-	// version 3 on the quic carrier.
-	Egress bool `inbound:"egress,omitempty"`
-}
-
-// NowhereNextOption is the next-hop Portal for native Portal chaining
-// (Nowhere 1.7+): when set, the listener forwards every inbound flow to
-// another Nowhere Portal instead of the tunnel. Validation mirrors the
-// outbound's carrier/mux/pool rules (adapter/outbound/nowhere.go).
-type NowhereNextOption struct {
-	Server   string `inbound:"server"`
-	Port     int    `inbound:"port"`
-	Password string `inbound:"password"`
-	// Up and Down independently select the carrier towards the next Portal
-	// ("tcp" or "udp"). Each defaults to "udp" and they must be set together.
-	Up   string `inbound:"up,omitempty"`
-	Down string `inbound:"down,omitempty"`
-	// Mux selects dedicated TLS lanes (0, default) or marked Mux shards (1)
-	// towards the next Portal. udp/udp&mux=1 canonicalizes to 0.
-	Mux *int `inbound:"mux,omitempty"`
-	// Pool is the warm TLS/TCP connection count, only meaningful for dedicated
-	// (mux=0) tcp/tcp (default 5 there, 0 otherwise; max tcptls.MaxPoolSize).
-	Pool *int `inbound:"pool,omitempty"`
-	// Dial4 is the IPv4 source address used towards the next Portal, or
-	// "auto". See nwtransport.DialPolicy.
-	Dial4 string `inbound:"dial4,omitempty"`
-	// Dial6 is the IPv6 source address used towards the next Portal, or
-	// "auto". See nwtransport.DialPolicy.
-	Dial6 string `inbound:"dial6,omitempty"`
-	// SNI overrides the TLS server name used towards the next Portal. Empty or
-	// the literal "none" disables certificate verification (a domain server is
-	// still sent as ClientHello SNI); an explicit DNS name enables chain+name
-	// verification.
-	SNI string `inbound:"sni,omitempty"`
-	// Pin is the next Portal's leaf-certificate SHA-256 (lowercase hex). When
-	// set (non-empty, non-"none") it overrides SNI/chain verification, like
-	// the outbound's pin.
-	Pin string `inbound:"pin,omitempty"`
-	// Morph overrides Morph towards the next Portal. Nil inherits the
-	// listener morph flag (official portal:// morph=1 controls both hops).
-	Morph *bool `inbound:"morph,omitempty"`
-}
-
-func (o NowhereOption) Equal(config C.InboundConfig) bool {
-	return optionToString(o) == optionToString(config)
-}
-
-type Nowhere struct {
-	*Base
-	config *NowhereOption
-	l      *nowhere.Server
-	ts     LC.NowhereServer
-}
-
-// NewNowhere builds the Nowhere inbound. The version is resolved first: 2 (the
-// default) keeps the full listener here, 3 hands the option to the Nowhere 3
-// listener, which speaks one carrier and owns its own handshake.
+// NewNowhere builds the Nowhere 3 (nw3) inbound. Nowhere 3 serves exactly one
+// transport with ALPN nw3 and TLS 1.3 and owns its own handshake, so the
+// Nowhere 2 listener fields (next chaining, ech-key, an alpn other than nw3) are
+// rejected instead of being silently ignored.
 func NewNowhere(options *NowhereOption) (*Nowhere, error) {
-	version, err := nwtransport.ResolveNowhereVersion(options.Version)
-	if err != nil {
-		return nil, fmt.Errorf("nowhere %s: %w", options.Name(), err)
-	}
-	if version == nwtransport.NowhereVersion3 {
-		return nil, errNowhereV3Dispatched
-	}
-	return newNowhereV2(options)
-}
-
-// errNowhereV3Dispatched marks the version-3 path: NewNowhere dispatches to
-// NewNowhereV3, so reaching this error means the caller ignored the version.
-var errNowhereV3Dispatched = errors.New("nowhere: version 3 must be built by NewNowhereV3")
-
-func newNowhereV2(options *NowhereOption) (*Nowhere, error) {
 	if options.Password == "" {
 		return nil, fmt.Errorf("nowhere %s: missing password", options.Name())
 	}
-	// The Portal admission rule (Rust Credentials::for_portal): the listener
-	// key and every enabled next-hop key must be 32–64 lowercase hexadecimal
-	// characters after URL percent decoding. Client-side keys stay lenient.
-	password, err := decodeNowherePortalKey("password", options.Password, options.Name())
-	if err != nil {
-		return nil, err
+	if err := nwtransport.ValidateNowhereServiceKey(options.Password); err != nil {
+		return nil, fmt.Errorf("nowhere %s: %w", options.Name(), err)
 	}
-	options.Password = password
 	if (options.Certificate == "") != (options.PrivateKey == "") {
 		return nil, fmt.Errorf("nowhere %s: certificate and private-key must be set together (omit both for an in-memory self-signed certificate)", options.Name())
 	}
-	// One-ALPN profile, mirroring the outbound's normalizeNowhereALPN: an
-	// omitted field uses the default supplied by ParseListener ("nw2").
-	if options.ALPN != nil {
-		if len(options.ALPN) != 1 {
-			return nil, fmt.Errorf("nowhere %s: alpn must contain exactly one value", options.Name())
-		}
-		if length := len(options.ALPN[0]); length == 0 || length > 255 {
-			return nil, fmt.Errorf("nowhere %s: invalid alpn length %d", options.Name(), length)
-		}
+	netName, err := nwtransport.NowhereNet(options.Net)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere %s: %w", options.Name(), err)
 	}
-	if err := validateNowhereNext(options.Name(), options.Next); err != nil {
-		return nil, err
+	if err := validateNowhereInbound(options, netName); err != nil {
+		return nil, fmt.Errorf("nowhere %s: %w", options.Name(), err)
 	}
-	morph := nwtransport.ResolveNowhereMorph(options.Morph, nwtransport.NowhereVersion2)
 	base, err := NewBase(&options.BaseOption)
 	if err != nil {
 		return nil, err
@@ -154,159 +46,56 @@ func newNowhereV2(options *NowhereOption) (*Nowhere, error) {
 			Password:             options.Password,
 			Certificate:          options.Certificate,
 			PrivateKey:           options.PrivateKey,
-			EchKey:               options.EchKey,
-			ALPN:                 options.ALPN,
 			CongestionController: options.CongestionController,
 			CWND:                 options.CWND,
-			Morph:                morph,
-			Next:                 nowhereNextConfig(options.Next, morph),
+			Net:                  netName,
+			Egress:               options.Egress,
+			Morph:                nwtransport.ResolveNowhereMorph(options.Morph, true),
 		},
 	}, nil
 }
 
-// validateNowhereNext checks the next-hop Portal section, mirroring the
-// outbound's carrier/pool/pin rules (adapter/outbound/nowhere.go).
-func validateNowhereNext(name string, next *NowhereNextOption) error {
-	if next == nil {
-		return nil
-	}
-	if next.Server == "" {
-		return fmt.Errorf("nowhere %s: next: missing server", name)
-	}
-	// Rust parses the port as u16.
-	if next.Port <= 0 || next.Port > 65535 {
-		return fmt.Errorf("nowhere %s: next: invalid port %d", name, next.Port)
-	}
-	if next.Password == "" {
-		return fmt.Errorf("nowhere %s: next: missing password", name)
-	}
-	// The Portal admission rule applies to every hop, including next.
-	decoded, err := decodeNowherePortalKey("next: password", next.Password, name)
+// validateNowhereInbound rejects the Nowhere 2 listener fields: the vendored
+// Portal performs its own handshake, so there is no next-hop chaining and no
+// ECH key. ALPN is omitted or pinned to nw3.
+func validateNowhereInbound(options *NowhereOption, netName string) error {
+	nw3, err := nwtransport.SelectNowhereStack(options.ALPN)
 	if err != nil {
 		return err
 	}
-	next.Password = decoded
-	if _, err := nwtransport.ResolveRoutePolicy(nwtransport.RouteInputs{
-		Prefix: fmt.Sprintf("nowhere %s: next", name),
-		Up:     next.Up,
-		Down:   next.Down,
-		Pool:   next.Pool,
-		Mux:    next.Mux,
-		Warn: func(format string, args ...any) {
-			log.Warnln("[Nowhere](%s) next "+format, append([]any{name}, args...)...)
-		},
-	}); err != nil {
-		return err
+	if !nw3 {
+		return errors.New("alpn selects the Nowhere 2 stack; omit alpn or set it to nw3")
 	}
-	if _, err := nwtransport.ParseDialPolicy("", next.Dial4, next.Dial6); err != nil {
-		return fmt.Errorf("nowhere %s: next: %w", name, err)
+	if options.Next != nil {
+		return errors.New("next is a Nowhere 2 option; set alpn to nw2 or remove it")
 	}
-	// Rust contract (vector/config.rs): the literal "none" is an alias for an
-	// omitted sni/pin.
-	if sni := normalizeNowhereNone(next.SNI); sni != "" && !validNowhereSNI(sni) {
-		return fmt.Errorf("nowhere %s: next: sni must be an ASCII DNS name", name)
+	if options.EchKey != "" {
+		return errors.New("ech-key is a Nowhere 2 option; set alpn to nw2 or remove it")
 	}
-	if pin := normalizeNowhereNone(next.Pin); pin != "" {
-		if _, err := nwtransport.ParseCertificatePin(pin); err != nil {
-			return fmt.Errorf("nowhere %s: next: %w", name, err)
-		}
+	// The Egress registration handshake only exists on QUIC.
+	if options.Egress && netName != nwtransport.NowhereNetUDP {
+		return errors.New("egress requires net: udp")
 	}
 	return nil
 }
 
-// normalizeNowhereNone maps the Rust "none" sentinel for sni/pin onto the
-// empty value, which the listener config treats as unset.
-func normalizeNowhereNone(value string) string {
-	if value == "none" {
-		return ""
-	}
-	return value
-}
-
-// nowherePortalKeyMinLen and nowherePortalKeyMaxLen bound the Portal shared-key
-// text. Odd lengths inside the range are accepted.
-const (
-	nowherePortalKeyMinLen = 32
-	nowherePortalKeyMaxLen = 64
-)
-
-// decodeNowherePortalKey enforces the Portal key admission rule (Rust
-// Credentials::for_portal and docs/configuration.md "Shared keys"): after URL
-// percent decoding the key must be 32–64 lowercase hexadecimal characters.
-// Uppercase letters, non-hex characters, whitespace and other lengths fail
-// before certificate loading, DNS resolution or listening. The decoded text
-// bytes are the authentication and Morph derivation input — there is no hex
-// decoding — so the decoded value is what the listener keeps.
-func decodeNowherePortalKey(field, key, name string) (string, error) {
-	decoded, err := url.PathUnescape(key)
-	if err != nil {
-		return "", fmt.Errorf("nowhere %s: %s: malformed percent escape in shared key", name, field)
-	}
-	if len(decoded) < nowherePortalKeyMinLen || len(decoded) > nowherePortalKeyMaxLen {
-		return "", nowherePortalKeyError(name, field)
-	}
-	for i := 0; i < len(decoded); i++ {
-		c := decoded[i]
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return "", nowherePortalKeyError(name, field)
-		}
-	}
-	return decoded, nil
-}
-
-func nowherePortalKeyError(name, field string) error {
-	return fmt.Errorf("nowhere %s: %s: shared key must be %d–%d lowercase hexadecimal characters (openssl rand -hex %d is a quick way to make one)",
-		name, field, nowherePortalKeyMinLen, nowherePortalKeyMaxLen, nowherePortalKeyMinLen/2)
-}
-
-// validNowhereSNI mirrors the Rust sni rule (vector/config.rs): an explicit
-// sni must be an ASCII DNS name — at most 253 bytes, no ':'/'['/']', and not
-// an IP literal.
-func validNowhereSNI(sni string) bool {
-	if len(sni) > 253 || strings.ContainsAny(sni, ":[]") {
-		return false
-	}
-	for i := 0; i < len(sni); i++ {
-		if sni[i] > 0x7f {
-			return false
-		}
-	}
-	if _, err := netip.ParseAddr(sni); err == nil {
-		return false
-	}
-	return true
-}
-
-// nowhereNextConfig maps the inbound next option onto the listener server
-// config; nil stays nil (direct tunnel upstream). sni/pin are normalized so
-// NowhereNext stores the effective values ("none" means unset).
-func nowhereNextConfig(o *NowhereNextOption, inboundMorph bool) *LC.NowhereNext {
-	if o == nil {
-		return nil
-	}
-	morph := inboundMorph
-	if o.Morph != nil {
-		morph = *o.Morph
-	}
-	return &LC.NowhereNext{
-		Server:   o.Server,
-		Port:     o.Port,
-		Password: o.Password,
-		Up:       o.Up,
-		Down:     o.Down,
-		Mux:      o.Mux,
-		Pool:     o.Pool,
-		Dial4:    o.Dial4,
-		Dial6:    o.Dial6,
-		SNI:      normalizeNowhereNone(o.SNI),
-		Pin:      normalizeNowhereNone(o.Pin),
-		Morph:    morph,
-	}
+// Nowhere is the Nowhere 3 Portal inbound: authenticated TCP streams and UDP
+// packet flows are handed to the tunnel exactly like any other protocol inbound.
+type Nowhere struct {
+	*Base
+	config *NowhereOption
+	ts     LC.NowhereServer
+	l      *nowhere.Server
 }
 
 // Config implements constant.InboundListener
 func (n *Nowhere) Config() C.InboundConfig {
 	return n.config
+}
+
+// Equal implements C.InboundConfig, mirroring the Nowhere 2 inbound.
+func (n *Nowhere) Equal(config C.InboundConfig) bool {
+	return optionToString(n.config) == optionToString(config)
 }
 
 // Address implements constant.InboundListener

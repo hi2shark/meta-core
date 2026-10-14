@@ -24,9 +24,9 @@ import (
 	"github.com/metacubex/tls"
 )
 
-// Native Portal chaining (Nowhere 1.7). When the listener config carries a
-// next section, the inbound forwards every authenticated flow to another
-// Nowhere Portal through a client-side CarrierBundle wrapped in
+// Native Portal chaining. When the listener config carries a next section,
+// the inbound forwards every authenticated flow to another Nowhere 2 Portal
+// through a client-side CarrierBundle wrapped in
 // nwserver.PortalUpstream, bypassing the tunnel entirely.
 
 // newPortalUpstream builds the next-hop client bundle for a chained Portal
@@ -35,9 +35,9 @@ import (
 // uses the listener congestion-controller/cwnd for its QUIC backend.
 //
 // The returned bundle is caller-owned: PortalUpstream borrows it without
-// taking ownership, so close the Server using the Upstream first and the
+// taking ownership, so close ServerV2 using the Upstream first and the
 // bundle second.
-func newPortalUpstream(next *LC.NowhereNext, alpn, congestionController string, cwnd int) (*nwserver.PortalUpstream, *nwtransport.CarrierBundle, error) {
+func newPortalUpstream(next *LC.NowhereNextV2, alpn, congestionController string, cwnd int) (*nwserver.PortalUpstream, *nwtransport.CarrierBundle, error) {
 	policy, err := resolvePortalNext(next)
 	if err != nil {
 		return nil, nil, err
@@ -134,10 +134,10 @@ func newPortalUpstream(next *LC.NowhereNext, alpn, congestionController string, 
 
 // resolvePortalNext validates the next section and resolves carrier, mux, and
 // pool defaults, mirroring the outbound's ResolveRoutePolicy rules.
-func resolvePortalNext(next *LC.NowhereNext) (nwtransport.RoutePolicy, error) {
+func resolvePortalNext(next *LC.NowhereNextV2) (nwtransport.RoutePolicy, error) {
 	// Rust contract (vector/config.rs): the literal "none" is an alias for an
 	// omitted sni/pin; normalize in place so a directly constructed
-	// LC.NowhereServer (bypassing the inbound option layer) behaves the same.
+	// LC.NowhereServerV2 (bypassing the inbound option layer) behaves the same.
 	next.SNI = normalizePortalNone(next.SNI)
 	next.Pin = normalizePortalNone(next.Pin)
 	if next.Server == "" {

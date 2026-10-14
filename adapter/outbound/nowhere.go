@@ -7,120 +7,30 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"time"
+
+	stdtls "crypto/tls"
 
 	N "github.com/metacubex/mihomo/common/net"
-	"github.com/metacubex/mihomo/component/ca"
-	"github.com/metacubex/mihomo/component/ech"
-	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
-	"github.com/metacubex/mihomo/transport/nowhere"
-	"github.com/metacubex/mihomo/transport/vmess"
+	nwtransport "github.com/metacubex/mihomo/transport/nowhere"
+	"github.com/metacubex/mihomo/transport/nowhere/core/morph"
+	"github.com/metacubex/mihomo/transport/nowhere/core/qio"
+	"github.com/metacubex/mihomo/transport/nowhere/core/vector"
 
-	"github.com/metacubex/quic-go"
 	"github.com/metacubex/tls"
 )
 
-// Nowhere is the Nowhere v2 proxy outbound. It speaks the protocol defined by
-// Nowhere/docs/protocol.md and supports the full client carrier matrix: the
-// upload and download carriers may each independently be TLS/TCP or QUIC/UDP.
-// Symmetric combinations (up==down) use the direct fast path; asymmetric
-// combinations are paired by the Portal on a shared session id and flow id.
-// TLS Mux (mux=1) shares marked TLS shards instead of dedicated lanes.
+// Nowhere is the Nowhere 3 (nw3) proxy outbound. Nowhere 3 speaks exactly one
+// transport per endpoint — tcp (TLS over TCP) or udp (QUIC) — with TLS 1.3,
+// ALPN nw3 and no multiplexing: the vendored Vector owns the handshake on both
+// transports and every flow rides its own session. Nowhere 2 keeps its own
+// outbound in nowhere_v2.go; the two stacks share no handshake.
 type Nowhere struct {
 	*Base
 	option *NowhereOption
 
-	bundle carrierBundle
-}
-
-// carrierBundle is the subset of *nowhere.CarrierBundle used by the outbound.
-// It exists so tests can substitute a recording fake.
-type carrierBundle interface {
-	OpenTCP(ctx context.Context, target nowhere.Target) (net.Conn, error)
-	OpenUDPAsync(ctx context.Context, target nowhere.Target) (net.PacketConn, error)
-	Close() error
-}
-
-// NowhereOption is the proxy map for a nowhere outbound.
-type NowhereOption struct {
-	BasicOption
-	Name   string `proxy:"name"`
-	Server string `proxy:"server"`
-	Port   int    `proxy:"port"`
-	// Password is the shared key used to authenticate to the Portal. It is the
-	// canonical field name (matching trojan/anytls/tuic).
-	Password string `proxy:"password,omitempty"`
-	// Up and Down independently select the upload and download carrier
-	// ("tcp" or "udp"). Each defaults to "udp" and they must be set
-	// together.
-	Up   string `proxy:"up,omitempty"`
-	Down string `proxy:"down,omitempty"`
-	// Mux selects dedicated TLS lanes (0, default) or marked Mux shards (1).
-	// Mux applies when either direction is tcp; udp/udp&mux=1
-	// canonicalizes to 0.
-	Mux *int `proxy:"mux,omitempty"`
-	// Pool is the warm TLS/TCP connection count (0..256), only meaningful for
-	// dedicated (mux=0) tcp/tcp. A nil/omitted value defaults to 5 there and 0
-	// for mux=1 or any matrix that can select QUIC. An explicit 0 disables the
-	// warm pool (every flow opens a fresh connection).
-	//
-	// Diagnostics: pool=0 is equivalent to disabling preconnect — every flow
-	// dials its own carrier, which is the cleanest signal when troubleshooting
-	// concurrent-speedtest anomalies (each flow must own a distinct carrier_id
-	// in the [Nowhere] [carrier] debug log). Compare pool=0 vs pool=5 to isolate
-	// warm-pool behavior from per-flow carrier behavior.
-	Pool *int `proxy:"pool,omitempty"`
-	// PrewarmOnStart fills the warm TLS/TCP pool at outbound start (tcp/tcp only).
-	// Default false keeps first-business-dial-then-replenish behavior.
-	PrewarmOnStart bool `proxy:"prewarm-on-start,omitempty"`
-	// MaxConcurrentDials caps in-flight physical TLS/TCP dials per outbound.
-	// Omitted/0 uses the shared-core default (16).
-	MaxConcurrentDials *int `proxy:"max-concurrent-dials,omitempty"`
-	// Dial4 is the IPv4 source address used for the Portal connection, or
-	// "auto". See nowhere.DialPolicy.
-	Dial4 string `proxy:"dial4,omitempty"`
-	// Dial6 is the IPv6 source address used for the Portal connection, or
-	// "auto". See nowhere.DialPolicy.
-	Dial6 string `proxy:"dial6,omitempty"`
-	// WarmBackoffInitial is the first warm-prepare retry delay in seconds after
-	// failure. Omitted/0 uses 1s.
-	WarmBackoffInitial *int `proxy:"warm-backoff-initial,omitempty"`
-	// WarmBackoffMax caps warm-prepare exponential backoff in seconds.
-	// Omitted/0 uses 30s.
-	WarmBackoffMax *int `proxy:"warm-backoff-max,omitempty"`
-
-	ALPN           []string `proxy:"alpn,omitempty"`
-	SNI            string   `proxy:"sni,omitempty"`
-	SkipCertVerify bool     `proxy:"skip-cert-verify,omitempty"`
-	Fingerprint    string   `proxy:"fingerprint,omitempty"`
-	// Pin is the Nowhere leaf-certificate SHA-256 (lowercase hex). When set it
-	// overrides SNI/chain verification for both TCP and QUIC carriers.
-	Pin               string     `proxy:"pin,omitempty"`
-	Certificate       string     `proxy:"certificate,omitempty"`
-	PrivateKey        string     `proxy:"private-key,omitempty"`
-	ClientFingerprint string     `proxy:"client-fingerprint,omitempty"`
-	ECHOpts           ECHOptions `proxy:"ech-opts,omitempty"`
-
-	CongestionController string `proxy:"congestion-controller,omitempty"`
-	CWND                 int    `proxy:"cwnd,omitempty"`
-
-	// Version selects the Nowhere protocol stack: 2 (default, the full carrier
-	// matrix above) or 3 (one carrier, no multiplexing, see nowhere_v3.go).
-	// An omitted value resolves to 2 so every pre-nw3 configuration keeps
-	// working unchanged.
-	Version int `proxy:"version,omitempty"`
-	// Carrier is the single Nowhere 3 transport: "tcp" (TLS over TCP, default)
-	// or "quic". It only applies to version 3.
-	Carrier string `proxy:"carrier,omitempty"`
-
-	UDP bool `proxy:"udp,omitempty"`
-	// Morph enables the Nowhere 2 keyed socket transform below TLS/QUIC
-	// (official CLI morph=1). YAML true/1 enable it; omitted/false/0 is morph=0.
-	// There is no negotiation: the Portal must use the same setting. Nowhere 3
-	// defaults the other way (on when omitted) — see nowhere_v3.go.
-	Morph *bool `proxy:"morph,omitempty"`
+	client *vector.Client
 }
 
 // DialContext implements C.ProxyAdapter.
@@ -129,7 +39,7 @@ func (n *Nowhere) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Co
 	if err != nil {
 		return nil, err
 	}
-	conn, err := n.bundle.OpenTCP(ctx, target)
+	conn, err := n.client.OpenTCP(ctx, target)
 	if err != nil {
 		return nil, err
 	}
@@ -137,23 +47,45 @@ func (n *Nowhere) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Co
 }
 
 // ListenPacketContext implements C.ProxyAdapter. Domain targets are passed to
-// the Portal unresolved: no local DNS resolution happens here.
+// the Portal unresolved: no local DNS resolution happens here. The vendored
+// Vector returns a datagram-oriented net.Conn (one Read/Write moves exactly one
+// datagram), which is what NewPacketConn expects.
 func (n *Nowhere) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	target, err := n.destination(metadata)
 	if err != nil {
 		return nil, err
 	}
-	pc, err := n.bundle.OpenUDPAsync(ctx, target)
+	pc, err := n.client.OpenUDP(ctx, target)
 	if err != nil {
 		return nil, err
 	}
-	return NewPacketConn(N.NewThreadSafePacketConn(pc), n), nil
+	return NewPacketConn(N.NewThreadSafePacketConn(&nw3UDPPacketConn{Conn: pc}), n), nil
 }
 
-// SupportUOT implements C.ProxyAdapter. The bundle exposes UoT whenever TCP can
-// be selected (a fixed tcp direction).
+// nw3UDPPacketConn presents the vendored Vector's connected datagram socket
+// (one Read/Write moves exactly one payload) as a net.PacketConn, so Mihomo's
+// packet machinery can drive it. The flow is bound to a single target, so
+// ReadFrom always reports that target and WriteTo ignores the address.
+type nw3UDPPacketConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c *nw3UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, err := c.Conn.Read(p)
+	return n, c.remote, err
+}
+
+func (c *nw3UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	return c.Conn.Write(p)
+}
+
+var _ net.PacketConn = (*nw3UDPPacketConn)(nil)
+
+// SupportUOT implements C.ProxyAdapter. The vendored Vector carries a UDP
+// association over the same carrier, so UoT is always available.
 func (n *Nowhere) SupportUOT() bool {
-	return n.option.Up != "udp" || n.option.Down != "udp"
+	return true
 }
 
 // ProxyInfo implements C.ProxyAdapter.
@@ -165,81 +97,50 @@ func (n *Nowhere) ProxyInfo() C.ProxyInfo {
 
 // Close implements C.ProxyAdapter.
 func (n *Nowhere) Close() error {
-	if n.bundle != nil {
-		return n.bundle.Close()
+	if n.client != nil {
+		return n.client.Close()
 	}
 	return nil
 }
 
-// destination converts Mihomo metadata to the typed Nowhere target. A
+// destination converts Mihomo metadata to the typed Nowhere 3 target. A
 // non-IP-literal Host always wins over an already-resolved DstIP so the
 // original domain reaches the Portal as a Domain Target; the Portal resolves
-// it. Wire-level validation (empty/oversized domain, non-ASCII, zero port,
-// embedded port, bracketed IPv6) lives in nowhere-go's wire constructors and
-// is intentionally not duplicated here.
-func (n *Nowhere) destination(metadata *C.Metadata) (nowhere.Target, error) {
+// it.
+func (n *Nowhere) destination(metadata *C.Metadata) (nwtransport.Nw3Target, error) {
 	if metadata == nil {
-		return nowhere.Target{}, errors.New("nowhere: nil destination metadata")
+		return nwtransport.Nw3Target{}, errors.New("nowhere: nil destination metadata")
 	}
 	if metadata.Host != "" {
 		if address, err := netip.ParseAddr(metadata.Host); err == nil {
-			return nowhere.NewIPTarget(address.Unmap(), metadata.DstPort)
+			return nwtransport.NewNw3IPTarget(address.Unmap(), metadata.DstPort)
 		}
-		return nowhere.NewDomainTarget(metadata.Host, metadata.DstPort)
+		return nwtransport.NewNw3DomainTarget(metadata.Host, metadata.DstPort)
 	}
 	if metadata.DstIP.IsValid() {
-		return nowhere.NewIPTarget(metadata.DstIP.Unmap(), metadata.DstPort)
+		return nwtransport.NewNw3IPTarget(metadata.DstIP.Unmap(), metadata.DstPort)
 	}
-	return nowhere.Target{}, errors.New("nowhere: empty destination")
+	return nwtransport.Nw3Target{}, errors.New("nowhere: empty destination")
 }
 
-// NewNowhere builds a Nowhere outbound from its option map. The version is
-// resolved first: 2 (the default) keeps the full carrier matrix here, 3 hands
-// the option to the Nowhere 3 outbound, which speaks one carrier.
+// NewNowhere builds the Nowhere 3 outbound. The transport is resolved first
+// so the Nowhere 2 knobs can be rejected before any socket work.
 func NewNowhere(option NowhereOption) (*Nowhere, error) {
-	version, err := nowhere.ResolveNowhereVersion(option.Version)
-	if err != nil {
-		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
-	}
-	if version == nowhere.NowhereVersion3 {
-		return nil, errNowhereV3Dispatched
-	}
-	return newNowhereV2(option)
-}
-
-// errNowhereV3Dispatched marks the version-3 path: NewNowhere dispatches to
-// NewNowhereV3, so reaching this error means the caller ignored the version.
-var errNowhereV3Dispatched = errors.New("nowhere: version 3 must be built by NewNowhereV3")
-
-func newNowhereV2(option NowhereOption) (*Nowhere, error) {
 	if option.Password == "" {
 		return nil, fmt.Errorf("nowhere %s: missing password", option.Name)
 	}
 	if option.Port <= 0 {
 		return nil, fmt.Errorf("nowhere %s: invalid port %d", option.Name, option.Port)
 	}
-	morph := nowhere.ResolveNowhereMorph(option.Morph, nowhere.NowhereVersion2)
-	policy, err := nowhere.ResolveRoutePolicy(nowhere.RouteInputs{
-		Prefix: fmt.Sprintf("nowhere %s", option.Name),
-		Up:     option.Up,
-		Down:   option.Down,
-		Pool:   option.Pool,
-		Mux:    option.Mux,
-		Warn: func(format string, args ...any) {
-			log.Warnln("[Nowhere](%s) "+format, append([]any{option.Name}, args...)...)
-		},
-	})
-	if err != nil {
-		return nil, err
+	if err := nwtransport.ValidateNowhereServiceKey(option.Password); err != nil {
+		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
 	}
-	dialPolicy, err := nowhere.ParseDialPolicy("", option.Dial4, option.Dial6)
+	netName, err := nwtransport.NowhereNet(option.Net)
 	if err != nil {
 		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
 	}
-	option.Up = policy.Up
-	option.Down = policy.Down
-	if option.ClientFingerprint != "" && policy.UsesQUIC {
-		log.Warnln("[Nowhere](%s) client-fingerprint applies only to TLS/TCP carrier; QUIC uses the standard TLS ClientHello", option.Name)
+	if err := validateNowhereOutbound(option); err != nil {
+		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
 	}
 
 	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
@@ -248,177 +149,126 @@ func newNowhereV2(option NowhereOption) (*Nowhere, error) {
 		serverName = option.SNI
 	}
 
-	credentials, err := nowhere.NewCredentials(option.Password)
+	base := NewBase(BaseOption{
+		Name:         option.Name,
+		Addr:         addr,
+		Type:         C.Nowhere,
+		ProviderName: option.ProviderName,
+		UDP:          option.UDP,
+		TFO:          option.TFO,
+		MPTCP:        option.MPTCP,
+		Interface:    option.Interface,
+		RoutingMark:  option.RoutingMark,
+		Prefer:       option.IPVersion,
+	})
+	hostDialer := option.NewDialer(base.DialOptions())
+	morphEnabled := nwtransport.ResolveNowhereMorph(option.Morph, true)
+
+	// The QUIC packet socket is sealed below QUIC on the host side; the TCP
+	// transport is wrapped inside the vendored Vector, so only QUIC needs the
+	// keys here.
+	var morphKeys *morph.Keys
+	if netName == nwtransport.NowhereNetUDP && morphEnabled {
+		morphKeys = nwtransport.Nw3MorphKeys(option.Password)
+	}
+	cfg := vector.Config{
+		SharedKey: option.Password,
+		Morph:     morphEnabled,
+	}
+	switch netName {
+	case nwtransport.NowhereNetTCP:
+		cfg.PortalAddr = addr
+		cfg.DialTCP = func(ctx context.Context, dialAddr string) (net.Conn, error) {
+			return hostDialer.DialContext(ctx, "tcp", dialAddr)
+		}
+		tlsConfig, err := nw3ClientTLSConfig(option, serverName)
+		if err != nil {
+			return nil, err
+		}
+		cfg.TLS = tlsConfig
+	default:
+		cfg.DialQUIC = func(ctx context.Context) (qio.Conn, error) {
+			return nwtransport.DialNowhereQUIC(
+				ctx,
+				nwtransport.NewSourceBoundDialer(nwtransport.DialPolicy{}, hostDialer),
+				addr,
+				nw3QUICClientTLSConfig(option, serverName),
+				nil,
+				morphKeys,
+				orDefault(option.CongestionController, "bbr"),
+				orInt(option.CWND, 32),
+			)
+		}
+	}
+	client, err := vector.New(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	echConfig, err := option.ECHOpts.Parse()
+	return &Nowhere{Base: base, option: &option, client: client}, nil
+}
+
+// validateNowhereOutbound rejects the Nowhere 2 outbound fields. Nowhere 3
+// uses one transport with fixed pooling, so up/down, mux, pool, the warm-dial
+// knobs and the TLS-engine knobs (uTLS fingerprint, ECH) have no meaning here.
+func validateNowhereOutbound(option NowhereOption) error {
+	nw3, err := nwtransport.SelectNowhereStack(option.ALPN)
+	if err != nil {
+		return err
+	}
+	if !nw3 {
+		return errors.New("alpn selects the Nowhere 2 stack; omit alpn or set it to nw3")
+	}
+	if option.Up != "" || option.Down != "" {
+		return errors.New("up and down are Nowhere 2 options; set alpn to nw2 or remove them")
+	}
+	if option.Mux != nil {
+		return errors.New("mux is a Nowhere 2 option; set alpn to nw2 or remove it")
+	}
+	if option.Pool != nil {
+		return errors.New("pool is a Nowhere 2 option; set alpn to nw2 or remove it")
+	}
+	if option.PrewarmOnStart {
+		return errors.New("prewarm-on-start is a Nowhere 2 option; set alpn to nw2 or remove it")
+	}
+	if option.MaxConcurrentDials != nil {
+		return errors.New("max-concurrent-dials is a Nowhere 2 option; set alpn to nw2 or remove it")
+	}
+	if option.WarmBackoffInitial != nil || option.WarmBackoffMax != nil {
+		return errors.New("warm backoff is a Nowhere 2 option; set alpn to nw2 or remove warm-backoff-initial and warm-backoff-max")
+	}
+	if option.Fingerprint != "" {
+		return errors.New("fingerprint is a Nowhere 2 option; set alpn to nw2 or remove it")
+	}
+	if option.ClientFingerprint != "" {
+		return errors.New("client-fingerprint is a Nowhere 2 option; set alpn to nw2 or remove it")
+	}
+	if len(option.ECHOpts.Config) > 0 {
+		return errors.New("ech-opts is a Nowhere 2 option; set alpn to nw2 or remove it")
+	}
+	return nil
+}
+
+// nw3ClientTLSConfig is the standard-library client config the vendored Vector
+// uses for the TCP carrier. Mihomo's effectiveTLS builds a metacubex/tls config
+// (uTLS, ECH), so the nw3 client cannot reuse it: the two types are not
+// convertible and Nowhere 3 pins TLS 1.3 with ALPN nw3 anyway.
+func nw3ClientTLSConfig(option NowhereOption, serverName string) (*stdtls.Config, error) {
+	pin, err := nwtransport.Nw3ParseCertificatePin(option.Pin)
 	if err != nil {
 		return nil, err
-	}
-
-	alpn, err := normalizeNowhereALPN(option.ALPN)
-	if err != nil {
-		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
-	}
-	// Normalize the pin before it is copied into effectiveTLS: empty or "none"
-	// disables pinning (Rust contract), a real pin is validated here so a bad
-	// value fails at construction instead of the first dial.
-	pin, err := nowhere.ParseCertificatePin(option.Pin)
-	if err != nil {
-		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
 	}
 	option.Pin = pin
-	if option.Pin != "" && option.Fingerprint != "" && option.Fingerprint != option.Pin {
-		log.Warnln("[Nowhere](%s) pin overrides fingerprint for leaf-certificate pinning", option.Name)
+	tlsConfig := &stdtls.Config{
+		ServerName:         serverName,
+		MinVersion:         stdtls.VersionTLS13,
+		MaxVersion:         stdtls.VersionTLS13,
+		NextProtos:         []string{nwtransport.NowhereALPN},
+		ClientSessionCache: nil,
+		InsecureSkipVerify: option.SkipCertVerify,
 	}
-	eff := newEffectiveTLS(option, serverName, alpn, echConfig)
-	var tlsConfig *tls.Config
-	if policy.UsesQUIC {
-		tlsConfig, err = eff.quicTLSConfig()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	n := &Nowhere{
-		Base: NewBase(BaseOption{
-			Name:         option.Name,
-			Addr:         addr,
-			Type:         C.Nowhere,
-			ProviderName: option.ProviderName,
-			UDP:          option.UDP,
-			TFO:          option.TFO,
-			MPTCP:        option.MPTCP,
-			Interface:    option.Interface,
-			RoutingMark:  option.RoutingMark,
-			Prefer:       option.IPVersion,
-		}),
-		option: &option,
-	}
-	n.dialer = nowhere.NewSourceBoundDialer(dialPolicy, option.NewDialer(n.DialOptions()))
-
-	quicConfig := &quic.Config{
-		EnableDatagrams:                true,
-		Allow0RTT:                      false,
-		KeepAlivePeriod:                0,
-		MaxIdleTimeout:                 120 * time.Second,
-		MaxIncomingStreams:             -1,
-		MaxIncomingUniStreams:          -1,
-		InitialStreamReceiveWindow:     nowhere.RecommendedStreamReceiveWindow,
-		MaxStreamReceiveWindow:         nowhere.RecommendedStreamReceiveWindow,
-		InitialConnectionReceiveWindow: nowhere.RecommendedConnectionReceiveWindow,
-		MaxConnectionReceiveWindow:     nowhere.RecommendedConnectionReceiveWindow,
-		// Send window / DATAGRAM buffer (32 MiB / 4 MiB) are not exposed by
-		// metacubex/quic-go Config; recv windows above mirror Vector 1.5.2.
-	}
-	quicCfg := &nowhere.QUICConfig{
-		Addr:       addr,
-		ServerName: serverName,
-		TLSConfig:  tlsConfig,
-		QUICConfig: quicConfig,
-		Dialer:     nowhere.WrapMorphPacketDialer(n.dialer, string(nowhere.MorphSharedKey(morph, option.Password))),
-		Congestion: orDefault(option.CongestionController, "bbr"),
-		CWND:       orInt(option.CWND, 32),
-		Observer:   nowhere.MihomoObserver{},
-		// Apply ECH on every QUIC dial, the same way hysteria2/tuic do inside
-		// their QuicDialer wrapper. echConfig.ClientHandle mutates the config,
-		// so the transport clones TLSConfig before calling this.
-		PrepareTLS: func(ctx context.Context, cfg *tls.Config) error {
-			return echConfig.ClientHandle(ctx, cfg)
-		},
-	}
-	var tcpCfg *nowhere.TCPConfig
-	if policy.UsesTCP {
-		var tlsDialer nowhere.TLSDialer = &vmessTLSDialer{cfg: eff.tcpTLSConfig()}
-		if option.Pin != "" {
-			tlsDialer = &pinTLSDialer{cfg: eff.tcpTLSConfig(), pin: option.Pin}
-		}
-		tcpCfg, err = nowhere.NewTCPConfig(nowhere.TCPOptions{
-			Address:            addr,
-			ConnectAddress:     addr, // direct dialer resolves the host; chained proxies go via dialer
-			Dialer:             n.dialer,
-			TLSDialer:          tlsDialer,
-			Observer:           nowhere.MihomoObserver{},
-			MaxConcurrentDials: derefInt(option.MaxConcurrentDials),
-			WarmBackoffInitial: secondsPtr(option.WarmBackoffInitial),
-			WarmBackoffMax:     secondsPtr(option.WarmBackoffMax),
-			MorphSharedKey:     nowhere.MorphSharedKey(morph, option.Password),
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-	bundleCfg := nowhere.BundleOptions{
-		TCP: tcpCfg, Credentials: credentials, ALPN: alpn, Observer: nowhere.MihomoObserver{},
-		PoolSize: policy.PoolSize, PrewarmOnStart: option.PrewarmOnStart,
-		Up: policy.UpCarrier(), Down: policy.DownCarrier(),
-		Mux: policy.Mux,
-	}
-	if policy.UsesQUIC {
-		bundleCfg.QUIC = nowhere.NewQuicBackend(quicCfg)
-	}
-	bundle, err := nowhere.NewCarrierBundle(bundleCfg)
-	if err != nil {
-		return nil, err
-	}
-	n.bundle = bundle
-
-	return n, nil
-}
-
-// effectiveTLS is the shared TLS policy for Nowhere TCP and QUIC carriers.
-type effectiveTLS struct {
-	serverName     string
-	skipCertVerify bool
-	fingerprint    string
-	pin            string
-	certificate    string
-	privateKey     string
-	clientFP       string
-	alpn           string
-	ech            *ech.Config
-}
-
-func newEffectiveTLS(option NowhereOption, serverName, alpn string, echConfig *ech.Config) effectiveTLS {
-	return effectiveTLS{
-		serverName:     serverName,
-		skipCertVerify: option.SkipCertVerify,
-		fingerprint:    option.Fingerprint,
-		pin:            option.Pin,
-		certificate:    option.Certificate,
-		privateKey:     option.PrivateKey,
-		clientFP:       option.ClientFingerprint,
-		alpn:           alpn,
-		ech:            echConfig,
-	}
-}
-
-func (e effectiveTLS) quicTLSConfig() (*tls.Config, error) {
-	fingerprint := e.fingerprint
-	skip := e.skipCertVerify
-	if e.pin != "" {
-		// Pin overrides fingerprint / SNI chain checks.
-		fingerprint = ""
-		skip = true
-	}
-	tlsConfig, err := ca.GetTLSConfig(ca.Option{
-		TLSConfig: &tls.Config{
-			ServerName:         e.serverName,
-			InsecureSkipVerify: skip,
-			MinVersion:         tls.VersionTLS13,
-			NextProtos:         []string{e.alpn},
-		},
-		Fingerprint: fingerprint,
-		Certificate: e.certificate,
-		PrivateKey:  e.privateKey,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if e.pin != "" {
-		verifier, err := nowhere.PeerCertificatePinVerifier(e.pin)
+	if pin != "" {
+		verifier, err := nwtransport.Nw3PeerCertificatePinVerifier(pin)
 		if err != nil {
 			return nil, err
 		}
@@ -428,156 +278,25 @@ func (e effectiveTLS) quicTLSConfig() (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
-func (e effectiveTLS) tcpTLSConfig() *vmess.TLSConfig {
-	fingerprint := e.fingerprint
-	skip := e.skipCertVerify
-	if e.pin != "" {
-		fingerprint = ""
-		skip = true
+// nw3QUICClientTLSConfig is the metacubex/tls counterpart Mihomo's QUIC stack
+// speaks. It mirrors nw3ClientTLSConfig: same pins, same TLS 1.3 / ALPN nw3, no
+// session resumption.
+func nw3QUICClientTLSConfig(option NowhereOption, serverName string) *tls.Config {
+	tlsConfig := &tls.Config{
+		ServerName:         serverName,
+		MinVersion:         tls.VersionTLS13,
+		MaxVersion:         tls.VersionTLS13,
+		NextProtos:         []string{nwtransport.NowhereALPN},
+		ClientSessionCache: nil,
+		InsecureSkipVerify: option.SkipCertVerify,
 	}
-	return &vmess.TLSConfig{
-		Host:              e.serverName,
-		SkipCertVerify:    skip,
-		FingerPrint:       fingerprint,
-		Certificate:       e.certificate,
-		PrivateKey:        e.privateKey,
-		ClientFingerprint: e.clientFP,
-		NextProtos:        []string{e.alpn},
-		MinVersion:        tls.VersionTLS13,
-		ECH:               e.ech,
+	if option.Pin != "" {
+		if verifier, err := nwtransport.Nw3PeerCertificatePinVerifier(option.Pin); err == nil {
+			tlsConfig.InsecureSkipVerify = true
+			tlsConfig.VerifyPeerCertificate = verifier
+		} else {
+			log.Warnln("[Nowhere](%s) invalid pin: %s", option.Name, err)
+		}
 	}
-}
-
-// pinTLSDialer performs a TLS 1.3 handshake with Nowhere leaf-certificate pin
-// verification (overrides SNI/chain checks).
-type pinTLSDialer struct {
-	cfg *vmess.TLSConfig
-	pin string
-}
-
-func (t *pinTLSDialer) DialTLSConn(ctx context.Context, c net.Conn) (nowhere.HandshakedConn, error) {
-	tlsConfig, err := t.cfg.ToStdConfig()
-	if err != nil {
-		return nowhere.HandshakedConn{}, err
-	}
-	verifier, err := nowhere.PeerCertificatePinVerifier(t.pin)
-	if err != nil {
-		return nowhere.HandshakedConn{}, err
-	}
-	tlsConfig.InsecureSkipVerify = true
-	tlsConfig.VerifyPeerCertificate = verifier
-	tlsConn := tls.Client(c, tlsConfig)
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		_ = tlsConn.Close()
-		return nowhere.HandshakedConn{}, err
-	}
-	state := tlsConn.ConnectionState()
-	material, err := state.ExportKeyingMaterial(nowhere.TLSExporterLabel, nowhere.EmptyTLSExporterContext(), nowhere.TLSExporterLen)
-	if err != nil {
-		_ = tlsConn.Close()
-		return nowhere.HandshakedConn{}, err
-	}
-	if len(material) != nowhere.TLSExporterLen {
-		_ = tlsConn.Close()
-		return nowhere.HandshakedConn{}, errors.New("nowhere: invalid TLS exporter length")
-	}
-	var exporter nowhere.TLSExporter
-	copy(exporter[:], material)
-	return nowhere.HandshakedConn{
-		Conn: tlsConn,
-		TLSHandshakeInfo: nowhere.TLSHandshakeInfo{
-			TLSVersion: state.Version, NegotiatedALPN: state.NegotiatedProtocol, Exporter: exporter,
-		},
-	}, nil
-}
-
-// vmessTLSDialer adapts Mihomo's actual TLS handshake and derives the
-// connection-bound exporter. A TLS engine that cannot expose exporter material
-// is rejected rather than falling back to the retired password-only auth.
-type vmessTLSDialer struct{ cfg *vmess.TLSConfig }
-
-func (t *vmessTLSDialer) DialTLSConn(ctx context.Context, c net.Conn) (nowhere.HandshakedConn, error) {
-	conn, err := vmess.StreamTLSConn(ctx, c, t.cfg)
-	if err != nil {
-		return nowhere.HandshakedConn{}, err
-	}
-	var material []byte
-	var version uint16
-	var negotiatedALPN string
-	switch tlsConn := conn.(type) {
-	case *tls.Conn:
-		state := tlsConn.ConnectionState()
-		version = state.Version
-		negotiatedALPN = state.NegotiatedProtocol
-		material, err = state.ExportKeyingMaterial(nowhere.TLSExporterLabel, nowhere.EmptyTLSExporterContext(), nowhere.TLSExporterLen)
-	case *tlsC.UConn:
-		state := tlsConn.ConnectionState()
-		version = state.Version
-		negotiatedALPN = state.NegotiatedProtocol
-		material, err = state.ExportKeyingMaterial(nowhere.TLSExporterLabel, nowhere.EmptyTLSExporterContext(), nowhere.TLSExporterLen)
-	default:
-		err = errors.New("nowhere: selected TLS engine does not expose TLS exporter")
-	}
-	if err != nil {
-		_ = conn.Close()
-		return nowhere.HandshakedConn{}, err
-	}
-	if len(material) != nowhere.TLSExporterLen {
-		_ = conn.Close()
-		return nowhere.HandshakedConn{}, errors.New("nowhere: invalid TLS exporter length")
-	}
-	var exporter nowhere.TLSExporter
-	copy(exporter[:], material)
-	return nowhere.HandshakedConn{
-		Conn: conn,
-		TLSHandshakeInfo: nowhere.TLSHandshakeInfo{
-			TLSVersion: version, NegotiatedALPN: negotiatedALPN, Exporter: exporter,
-		},
-	}, nil
-}
-
-const defaultNowhereALPN = nowhere.DefaultALPN
-
-// normalizeNowhereALPN enforces the one-ALPN Nowhere profile. A missing field
-// uses the protocol default; an explicitly supplied field must contain one
-// non-empty TLS protocol name that the Go TLS implementation can encode.
-func normalizeNowhereALPN(alpn []string) (string, error) {
-	if alpn == nil {
-		return defaultNowhereALPN, nil
-	}
-	if len(alpn) != 1 {
-		return "", fmt.Errorf("alpn must contain exactly one value")
-	}
-	if length := len(alpn[0]); length == 0 || length > 255 {
-		return "", fmt.Errorf("invalid alpn length %d", length)
-	}
-	return alpn[0], nil
-}
-
-func orDefault(s, def string) string {
-	if s == "" {
-		return def
-	}
-	return s
-}
-
-func orInt(v, def int) int {
-	if v == 0 {
-		return def
-	}
-	return v
-}
-
-func derefInt(v *int) int {
-	if v == nil {
-		return 0
-	}
-	return *v
-}
-
-func secondsPtr(v *int) time.Duration {
-	if v == nil || *v == 0 {
-		return 0
-	}
-	return time.Duration(*v) * time.Second
+	return tlsConfig
 }

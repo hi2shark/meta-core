@@ -30,7 +30,7 @@ const (
 	NowhereV3ExporterLen   = wire.ExporterLen
 )
 
-var errNowhereV3NilTLS = errors.New("nowhere: missing tls config")
+var errNowhereNilTLS = errors.New("nowhere: missing tls config")
 
 // QIOStream adapts *quic.Stream to the vendored qio.Stream. quic-go's Close
 // sends FIN and keeps the receive side open, which is exactly CloseWrite; a
@@ -126,13 +126,13 @@ func (l *QIOListener) Accept(ctx context.Context) (qio.Conn, error) {
 
 func (l *QIOListener) Close() error { return l.listener.Close() }
 
-// DialNowhereV3QUIC opens the QUIC carrier for the Vector/Egress client. Morph
+// DialNowhereQUIC opens the QUIC carrier for the Vector/Egress client. Morph
 // seals the packet socket below QUIC on the host side; the TCP carrier is
 // wrapped inside the vendored stack, so only QUIC needs this. The TLS config
 // already pins TLS 1.3 and ALPN nw3 with session resumption disabled.
-func DialNowhereV3QUIC(ctx context.Context, packetDialer common.PacketDialer, addr string, tlsConfig *tls.Config, quicConfig *quic.Config, keys *morph.Keys, congestionController string, cwnd int) (qio.Conn, error) {
+func DialNowhereQUIC(ctx context.Context, packetDialer common.PacketDialer, addr string, tlsConfig *tls.Config, quicConfig *quic.Config, keys *morph.Keys, congestionController string, cwnd int) (qio.Conn, error) {
 	if tlsConfig == nil {
-		return nil, errNowhereV3NilTLS
+		return nil, errNowhereNilTLS
 	}
 	if quicConfig == nil {
 		quicConfig = nowhereV3QUICConfig(keys != nil)
@@ -151,11 +151,11 @@ func DialNowhereV3QUIC(ctx context.Context, packetDialer common.PacketDialer, ad
 	return NewQIOConn(qconn), nil
 }
 
-// ListenNowhereV3QUIC starts the QUIC listener for the Portal. Morph seals the
+// ListenNowhereQUIC starts the QUIC listener for the Portal. Morph seals the
 // listening socket below QUIC when enabled.
-func ListenNowhereV3QUIC(ctx context.Context, packetConn net.PacketConn, tlsConfig *tls.Config, quicConfig *quic.Config, keys *morph.Keys, congestionController string, cwnd int) (qio.Listener, error) {
+func ListenNowhereQUIC(ctx context.Context, packetConn net.PacketConn, tlsConfig *tls.Config, quicConfig *quic.Config, keys *morph.Keys, congestionController string, cwnd int) (qio.Listener, error) {
 	if tlsConfig == nil {
-		return nil, errNowhereV3NilTLS
+		return nil, errNowhereNilTLS
 	}
 	if keys != nil {
 		packetConn = morph.WrapPacketConn(packetConn, *keys, false)

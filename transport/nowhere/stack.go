@@ -10,64 +10,66 @@ import (
 	"github.com/metacubex/mihomo/transport/nowhere/core/wire"
 )
 
-// Nowhere 3 (nw3) stack selection. The two stacks share no handshake: one
-// endpoint runs exactly one version, and the nw2-only fields are rejected when
-// version 3 is selected. Nowhere 2 keeps working unchanged because an omitted
-// version resolves to 2.
-const (
-	NowhereVersion2 = 2
-	NowhereVersion3 = 3
-)
-
-// ResolveNowhereVersion maps the raw version option to a stack. Empty means 2,
-// which keeps every pre-nw3 configuration working unchanged.
-func ResolveNowhereVersion(raw int) (int, error) {
-	switch raw {
-	case 0, NowhereVersion2:
-		return NowhereVersion2, nil
-	case NowhereVersion3:
-		return NowhereVersion3, nil
+// SelectNowhereStack reports which protocol stack one endpoint runs. An omitted
+// ALPN, or a single value of NowhereALPN, selects Nowhere 3. Exactly nw2
+// selects Nowhere 2. An empty name, more than one name, or any other protocol
+// name is rejected.
+func SelectNowhereStack(alpn []string) (nw3 bool, err error) {
+	if len(alpn) == 0 {
+		return true, nil
+	}
+	if len(alpn) != 1 {
+		return false, errNowhereALPNCount()
+	}
+	if length := len(alpn[0]); length == 0 || length > 255 {
+		return false, errNowhereALPNLength(length)
+	}
+	switch alpn[0] {
+	case NowhereALPN:
+		return true, nil
+	case nw2wire.DefaultALPN:
+		return false, nil
 	default:
-		return 0, errNowhereVersion(raw)
+		return false, errNowhereALPNName(alpn[0])
 	}
 }
 
-// ResolveNowhereMorph applies the per-version Morph default: Nowhere 2 leaves
-// the transform off, Nowhere 3 turns it on. An explicit value always wins.
-func ResolveNowhereMorph(raw *bool, version int) bool {
+// ResolveNowhereMorph applies the per-stack Morph default: Nowhere 2 leaves the
+// transform off, Nowhere 3 turns it on. An explicit value always wins.
+func ResolveNowhereMorph(raw *bool, nw3 bool) bool {
 	if raw != nil {
 		return *raw
 	}
-	return version == NowhereVersion3
+	return nw3
 }
 
-// Nowhere 3 speaks exactly one transport per endpoint: tcp (TLS over TCP) or
-// quic. Empty means tcp.
+// Nowhere 3 speaks exactly one transport per endpoint. tcp is TLS over TCP and
+// udp is QUIC. Empty means tcp.
 const (
-	NowhereV3CarrierTCP  = "tcp"
-	NowhereV3CarrierQUIC = "quic"
+	NowhereNetTCP = "tcp"
+	NowhereNetUDP = "udp"
 )
 
-// NowhereV3Carrier resolves the single Nowhere 3 carrier.
-func NowhereV3Carrier(raw string) (string, error) {
+// NowhereNet resolves the single Nowhere 3 transport.
+func NowhereNet(raw string) (string, error) {
 	switch raw {
-	case "", NowhereV3CarrierTCP:
-		return NowhereV3CarrierTCP, nil
-	case NowhereV3CarrierQUIC:
-		return NowhereV3CarrierQUIC, nil
+	case "", NowhereNetTCP:
+		return NowhereNetTCP, nil
+	case NowhereNetUDP:
+		return NowhereNetUDP, nil
 	default:
-		return "", errNowhereV3Carrier(raw)
+		return "", errNowhereNet(raw)
 	}
 }
 
-// NowhereV3ALPN is the only protocol identifier an nw3 carrier offers or
+// NowhereALPN is the only protocol identifier an nw3 carrier offers or
 // accepts. The vendored stack pins it and never negotiates or falls back.
-const NowhereV3ALPN = wire.ALPN
+const NowhereALPN = wire.ALPN
 
-// ValidateNowhereV3ServiceKey enforces the nw3 shared-key rule: exactly 32
+// ValidateNowhereServiceKey enforces the nw3 shared-key rule: exactly 32
 // lowercase hexadecimal characters. Nowhere 2 accepts 32–64, so the check has
 // to live at the nw3 boundary rather than in the shared credential helper.
-func ValidateNowhereV3ServiceKey(key string) error {
+func ValidateNowhereServiceKey(key string) error {
 	return wire.ValidateServiceKey(key)
 }
 
@@ -114,10 +116,18 @@ func Nw3LeafCertificateSHA256Hex(raw []byte) string {
 	return nw2wire.LeafCertificateSHA256Hex(raw)
 }
 
-func errNowhereVersion(raw int) error {
-	return fmt.Errorf("nowhere: version must be %d or %d, got %d", NowhereVersion2, NowhereVersion3, raw)
+func errNowhereALPNCount() error {
+	return fmt.Errorf("nowhere: alpn must contain exactly one value")
 }
 
-func errNowhereV3Carrier(raw string) error {
-	return fmt.Errorf("nowhere: version %d carrier must be %s or %s, got %q", NowhereVersion3, NowhereV3CarrierTCP, NowhereV3CarrierQUIC, raw)
+func errNowhereALPNLength(length int) error {
+	return fmt.Errorf("nowhere: invalid alpn length %d", length)
+}
+
+func errNowhereALPNName(name string) error {
+	return fmt.Errorf("nowhere: alpn must be nw3 or nw2, got %q", name)
+}
+
+func errNowhereNet(raw string) error {
+	return fmt.Errorf("nowhere: net must be %s or %s, got %q", NowhereNetTCP, NowhereNetUDP, raw)
 }

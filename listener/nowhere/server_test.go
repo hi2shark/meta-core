@@ -1,7 +1,6 @@
 package nowhere_test
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net"
@@ -11,56 +10,113 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/adapter/outbound"
-	"github.com/metacubex/mihomo/component/ca"
 	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/listener"
 	LC "github.com/metacubex/mihomo/listener/config"
-	IN "github.com/metacubex/mihomo/listener/inbound"
 	nwlisten "github.com/metacubex/mihomo/listener/nowhere"
+	nwtransport "github.com/metacubex/mihomo/transport/nowhere"
 )
 
-// testPassword is a Portal-admissible shared key: 32 lowercase hexadecimal
-// characters, matching the Rust Credentials::for_portal rule. The outbound
-// accepts it unchanged because client-side keys stay lenient.
-const testPassword = "0123456789abcdef0123456789abcdef"
+// testNw3Password is a Nowhere 3 service key: exactly 32 lowercase hexadecimal
+// characters. The nw2 keys in server_v2_test.go are deliberately not reused here:
+// the two stacks have different key rules and must not be mixed.
+const testNw3Password = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 
-var testCertificate, testPrivateKey, _, _ = ca.NewRandomTLSKeyPair(ca.KeyPairTypeP256)
-
-// fakeTunnel echoes every TCP flow and every UDP datagram back to the client.
-type fakeTunnel struct{ C.Tunnel }
-
-func (fakeTunnel) HandleTCPConn(conn net.Conn, _ *C.Metadata) {
-	defer func() { _ = conn.Close() }()
-	_, _ = io.Copy(conn, conn)
+func TestSelectNowhereStack(t *testing.T) {
+	for _, alpn := range [][]string{nil, {}, {"nw3"}} {
+		nw3, err := nwtransport.SelectNowhereStack(alpn)
+		if err != nil {
+			t.Fatalf("SelectNowhereStack(%q): %v", alpn, err)
+		}
+		if !nw3 {
+			t.Fatalf("SelectNowhereStack(%q) = Nowhere 2, want Nowhere 3", alpn)
+		}
+	}
+	nw3, err := nwtransport.SelectNowhereStack([]string{"nw2"})
+	if err != nil {
+		t.Fatalf("SelectNowhereStack(nw2): %v", err)
+	}
+	if nw3 {
+		t.Fatal("SelectNowhereStack(nw2) = Nowhere 3, want Nowhere 2")
+	}
+	for _, alpn := range [][]string{{""}, {"nw2", "nw3"}, {"now/1"}, {string(make([]byte, 256))}} {
+		if _, err := nwtransport.SelectNowhereStack(alpn); err == nil {
+			t.Fatalf("SelectNowhereStack(%q) = nil error, want an alpn error", alpn)
+		}
+	}
 }
 
-func (fakeTunnel) HandleUDPPacket(packet C.UDPPacket, _ *C.Metadata) {
-	_, _ = packet.WriteBack(packet.Data(), nil)
+func TestResolveNowhereMorph(t *testing.T) {
+	// Nowhere 2 leaves Morph off when omitted, Nowhere 3 turns it on.
+	if nwtransport.ResolveNowhereMorph(nil, false) {
+		t.Fatal("omitted morph resolved on for Nowhere 2")
+	}
+	if !nwtransport.ResolveNowhereMorph(nil, true) {
+		t.Fatal("omitted morph resolved off for Nowhere 3")
+	}
+	on, off := true, false
+	if !nwtransport.ResolveNowhereMorph(&on, false) {
+		t.Fatal("explicit morph=true ignored for Nowhere 2")
+	}
+	if nwtransport.ResolveNowhereMorph(&off, true) {
+		t.Fatal("explicit morph=false ignored for Nowhere 3")
+	}
 }
 
-// startTestServer binds 127.0.0.1:0; the listener binds TCP and UDP on the
-// same OS-assigned port, reported through AddrList.
-func startTestServer(t *testing.T) int {
-	return startTestServerWith(t, testCertificate, testPrivateKey)
+func TestNowhereV3Net(t *testing.T) {
+	for _, testCase := range []struct {
+		raw string
+		net string
+	}{
+		{"", nwtransport.NowhereNetTCP},
+		{"tcp", nwtransport.NowhereNetTCP},
+		{"udp", nwtransport.NowhereNetUDP},
+	} {
+		netName, err := nwtransport.NowhereNet(testCase.raw)
+		if err != nil {
+			t.Fatalf("NowhereNet(%q): %v", testCase.raw, err)
+		}
+		if netName != testCase.net {
+			t.Fatalf("NowhereNet(%q) = %q, want %q", testCase.raw, netName, testCase.net)
+		}
+	}
+	for _, raw := range []string{"quic", "ws"} {
+		if _, err := nwtransport.NowhereNet(raw); err == nil {
+			t.Fatalf("NowhereNet(%q) = nil error, want a net error", raw)
+		}
+	}
 }
 
-// startTestServerWith is startTestServer with an explicit certificate pair;
-// pass empty strings for the in-memory self-signed fallback.
-func startTestServerWith(t *testing.T, certificate, privateKey string) int {
-	return startTestServerConfig(t, LC.NowhereServer{
+func TestValidateNowhereV3ServiceKey(t *testing.T) {
+	if err := nwtransport.ValidateNowhereServiceKey(testNw3Password); err != nil {
+		t.Fatalf("ValidateNowhereServiceKey(%q): %v", testNw3Password, err)
+	}
+	for _, key := range []string{
+		"",
+		"xyz",
+		// 32–64 is the Nowhere 2 rule; Nowhere 3 wants exactly 32.
+		"0123456789abcdef0123456789abcdef01234567",
+		"0123456789ABCDEF0123456789ABCDEF",
+	} {
+		if err := nwtransport.ValidateNowhereServiceKey(key); err == nil {
+			t.Fatalf("ValidateNowhereServiceKey(%q) = nil error, want a key error", key)
+		}
+	}
+}
+
+// startNw3TestServer binds 127.0.0.1:0 with the Nowhere 3 Portal on the given
+// transport and reports the port the vendored stack actually listens on.
+func startNw3TestServer(t *testing.T, netName string, morph bool) int {
+	t.Helper()
+	server, err := nwlisten.New(LC.NowhereServer{
 		Enable:               true,
 		Listen:               "127.0.0.1:0",
-		Password:             testPassword,
-		Certificate:          certificate,
-		PrivateKey:           privateKey,
-		ALPN:                 []string{"nw2"},
+		Password:             testNw3Password,
+		Certificate:          testCertificate,
+		PrivateKey:           testPrivateKey,
 		CongestionController: "bbr",
-	})
-}
-
-func startTestServerConfig(t *testing.T, cfg LC.NowhereServer) int {
-	t.Helper()
-	server, err := nwlisten.New(cfg, inbound.NewListenConfig(), fakeTunnel{})
+		Net:                  netName,
+		Morph:                morph,
+	}, inbound.NewListenConfig(), fakeTunnel{})
 	if err != nil {
 		t.Fatalf("nowhere.New: %v", err)
 	}
@@ -81,18 +137,14 @@ func startTestServerConfig(t *testing.T, cfg LC.NowhereServer) int {
 	return port
 }
 
-func newTestClient(t *testing.T, port int, up, down string) *outbound.Nowhere {
-	return newTestClientOpt(t, port, up, down, nil)
-}
-
-func newTestClientOpt(t *testing.T, port int, up, down string, morph *bool) *outbound.Nowhere {
+func newNw3TestClient(t *testing.T, port int, netName string, morph bool) *outbound.Nowhere {
 	t.Helper()
 	client, err := outbound.NewNowhere(outbound.NowhereOption{
-		Name: "nowhere-test-client", Server: "127.0.0.1", Port: port,
-		Password: testPassword, SkipCertVerify: true,
-		Up: up, Down: down,
+		Name: "nowhere-nw3-test-client", Server: "127.0.0.1", Port: port,
+		Password: testNw3Password, SkipCertVerify: true,
+		Net:   netName,
+		Morph: &morph,
 		UDP:   true,
-		Morph: morph,
 	})
 	if err != nil {
 		t.Fatalf("outbound.NewNowhere: %v", err)
@@ -101,10 +153,13 @@ func newTestClientOpt(t *testing.T, port int, up, down string, morph *bool) *out
 	return client
 }
 
-func testTCPEcho(t *testing.T, client *outbound.Nowhere) {
+// testNw3Forwarding drives one TCP flow and one UDP flow through a Nowhere 3
+// endpoint pair and asserts both round-trip through the echo tunnel.
+func testNw3Forwarding(t *testing.T, client *outbound.Nowhere) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
 	conn, err := client.DialContext(ctx, &C.Metadata{Host: "example.com", DstPort: 80})
 	if err != nil {
 		t.Fatalf("DialContext: %v", err)
@@ -112,223 +167,53 @@ func testTCPEcho(t *testing.T, client *outbound.Nowhere) {
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	payload := []byte("nowhere tcp echo")
+	payload := []byte("nowhere nw3 tcp echo")
 	if _, err := conn.Write(payload); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	buf := make([]byte, len(payload))
 	if _, err := io.ReadFull(conn, buf); err != nil {
-		t.Fatalf("read echo: %v", err)
+		t.Fatalf("read: %v", err)
 	}
-	if !bytes.Equal(buf, payload) {
-		t.Fatalf("echo = %q, want %q", buf, payload)
+	if string(buf) != string(payload) {
+		t.Fatalf("tcp echo = %q, want %q", buf, payload)
 	}
-}
 
-func testUDPEcho(t *testing.T, client *outbound.Nowhere) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	pc, err := client.ListenPacketContext(ctx, &C.Metadata{Host: "example.com", DstPort: 53})
+	pc, err := client.ListenPacketContext(ctx, &C.Metadata{Host: "example.com", DstPort: 80})
 	if err != nil {
 		t.Fatalf("ListenPacketContext: %v", err)
 	}
 	defer func() { _ = pc.Close() }()
+	_ = pc.SetDeadline(time.Now().Add(5 * time.Second))
 
-	// A single reader for the whole association. The Portal drops datagrams
-	// that arrive before the flow is READY by design (anti-replay), so the
-	// first write may legitimately be lost: retry the write until an echo
-	// comes back instead of failing on one dropped packet.
-	type echoResult struct {
-		data []byte
-		err  error
+	udpPayload := []byte("nowhere nw3 udp echo")
+	if _, err := pc.WriteTo(udpPayload, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 80}); err != nil {
+		t.Fatalf("udp write: %v", err)
 	}
-	results := make(chan echoResult, 1)
-	go func() {
-		buf := make([]byte, 2048)
-		n, _, err := pc.ReadFrom(buf)
-		results <- echoResult{data: buf[:n], err: err}
-	}()
-
-	payload := []byte("nowhere udp echo")
-	for attempt := 0; attempt < 5; attempt++ {
-		if _, err := pc.WriteTo(payload, nil); err != nil {
-			t.Fatalf("WriteTo: %v", err)
-		}
-		select {
-		case r := <-results:
-			if r.err != nil {
-				t.Fatalf("ReadFrom: %v", r.err)
-			}
-			if !bytes.Equal(r.data, payload) {
-				t.Fatalf("echo = %q, want %q", r.data, payload)
-			}
-			return
-		case <-time.After(time.Second):
-		case <-ctx.Done():
-			t.Fatalf("udp echo: %v", ctx.Err())
-		}
+	udpBuf := make([]byte, len(udpPayload)+1)
+	n, _, err := pc.ReadFrom(udpBuf)
+	if err != nil {
+		t.Fatalf("udp read: %v", err)
 	}
-	t.Fatal("udp echo: no reply after 5 attempts")
-}
-
-// TestNowhereInboundInterop runs the real outbound against the real inbound
-// over every carrier matrix: tcp/tcp (TLS/TCP carrier: duplex TCP flow plus
-// UoT), udp/udp (QUIC carrier), and the asymmetric tcp/udp + udp/tcp splits
-// that exercise cross-carrier OPEN/ATTACH pairing.
-func TestNowhereInboundInterop(t *testing.T) {
-	for _, carriers := range [][2]string{{"tcp", "tcp"}, {"udp", "udp"}, {"tcp", "udp"}, {"udp", "tcp"}} {
-		up, down := carriers[0], carriers[1]
-		t.Run(up+"/"+down, func(t *testing.T) {
-			client := newTestClient(t, startTestServer(t), up, down)
-			t.Run("tcp echo", func(t *testing.T) { testTCPEcho(t, client) })
-			t.Run("udp echo", func(t *testing.T) { testUDPEcho(t, client) })
-		})
+	if string(udpBuf[:n]) != string(udpPayload) {
+		t.Fatalf("udp echo = %q, want %q", udpBuf[:n], udpPayload)
 	}
 }
 
-// TestNowhereInboundSelfSigned covers the in-memory self-signed fallback:
-// a listener started without certificate/private-key must still complete the
-// full handshake and relay flows (clients use skip-cert-verify or pin).
-func TestNowhereInboundSelfSigned(t *testing.T) {
-	server, err := nwlisten.New(LC.NowhereServer{
-		Enable:               true,
-		Listen:               "127.0.0.1:0",
-		Password:             testPassword,
-		ALPN:                 []string{"nw2"},
-		CongestionController: "bbr",
-	}, inbound.NewListenConfig(), fakeTunnel{})
-	if err != nil {
-		t.Fatalf("nowhere.New without certificate: %v", err)
-	}
-	t.Cleanup(func() { _ = server.Close() })
-
-	_, portStr, err := net.SplitHostPort(server.AddrList()[0])
-	if err != nil {
-		t.Fatalf("SplitHostPort: %v", err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		t.Fatalf("port %q: %v", portStr, err)
-	}
-
-	client := newTestClient(t, port, "tcp", "tcp")
-	t.Run("tcp echo", func(t *testing.T) { testTCPEcho(t, client) })
-	t.Run("udp echo", func(t *testing.T) { testUDPEcho(t, client) })
+// TestNowhereV3TCPForwarding runs a full Nowhere 3 endpoint pair over the TCP
+// carrier with Morph on (the Nowhere 3 default): Portal -> echo tunnel and back,
+// for a TCP flow and for a UDP flow carried as UoT inside the TLS connection.
+func TestNowhereV3TCPForwarding(t *testing.T) {
+	port := startNw3TestServer(t, nwtransport.NowhereNetTCP, true)
+	client := newNw3TestClient(t, port, nwtransport.NowhereNetTCP, true)
+	testNw3Forwarding(t, client)
 }
 
-func TestParseListenerNowhere(t *testing.T) {
-	mapping := map[string]any{
-		"name":        "nowhere-in",
-		"type":        "nowhere",
-		"listen":      "127.0.0.1",
-		"port":        "1443",
-		"password":    testPassword,
-		"certificate": testCertificate,
-		"private-key": testPrivateKey,
-	}
-	parsed, err := listener.ParseListener(mapping)
-	if err != nil {
-		t.Fatalf("ParseListener: %v", err)
-	}
-	if parsed.Name() != "nowhere-in" {
-		t.Fatalf("Name() = %q, want %q", parsed.Name(), "nowhere-in")
-	}
-	option, ok := parsed.Config().(*IN.NowhereOption)
-	if !ok {
-		t.Fatalf("Config() = %T, want *inbound.NowhereOption", parsed.Config())
-	}
-	if len(option.ALPN) != 1 || option.ALPN[0] != "nw2" {
-		t.Fatalf("ALPN = %v, want [nw2]", option.ALPN)
-	}
-	if option.CongestionController != "bbr" {
-		t.Fatalf("CongestionController = %q, want bbr", option.CongestionController)
-	}
-	parsedAgain, err := listener.ParseListener(mapping)
-	if err != nil {
-		t.Fatalf("ParseListener again: %v", err)
-	}
-	if !parsed.Config().Equal(parsedAgain.Config()) {
-		t.Fatalf("Config() round-trip mismatch: %v vs %v", parsed.Config(), parsedAgain.Config())
-	}
-
-	// certificate/private-key are optional (in-memory self-signed fallback):
-	// the structure decoder must not report them as unset fields.
-	delete(mapping, "certificate")
-	delete(mapping, "private-key")
-	parsedSelfSigned, err := listener.ParseListener(mapping)
-	if err != nil {
-		t.Fatalf("ParseListener without certificate: %v", err)
-	}
-	optionSelfSigned, ok := parsedSelfSigned.Config().(*IN.NowhereOption)
-	if !ok {
-		t.Fatalf("Config() = %T, want *inbound.NowhereOption", parsedSelfSigned.Config())
-	}
-	if optionSelfSigned.Certificate != "" || optionSelfSigned.PrivateKey != "" {
-		t.Fatalf("Certificate/PrivateKey = %q/%q, want empty", optionSelfSigned.Certificate, optionSelfSigned.PrivateKey)
-	}
-
-	mapping["morph"] = 1
-	parsedMorph, err := listener.ParseListener(mapping)
-	if err != nil {
-		t.Fatalf("ParseListener morph=1: %v", err)
-	}
-	optionMorph, ok := parsedMorph.Config().(*IN.NowhereOption)
-	if !ok {
-		t.Fatalf("Config() = %T, want *inbound.NowhereOption", parsedMorph.Config())
-	}
-	if optionMorph.Morph == nil || !*optionMorph.Morph {
-		t.Fatal("Morph = false, want true for morph: 1")
-	}
-}
-
-func TestNowhereInboundMorph(t *testing.T) {
-	port := startTestServerConfig(t, LC.NowhereServer{
-		Enable:               true,
-		Listen:               "127.0.0.1:0",
-		Password:             testPassword,
-		Certificate:          testCertificate,
-		PrivateKey:           testPrivateKey,
-		ALPN:                 []string{"nw2"},
-		CongestionController: "bbr",
-		Morph:                true,
-	})
-	on := true
-	for _, carriers := range [][2]string{{"tcp", "tcp"}, {"udp", "udp"}, {"tcp", "udp"}, {"udp", "tcp"}} {
-		up, down := carriers[0], carriers[1]
-		t.Run(up+"/"+down, func(t *testing.T) {
-			client := newTestClientOpt(t, port, up, down, &on)
-			t.Run("tcp echo", func(t *testing.T) { testTCPEcho(t, client) })
-			t.Run("udp echo", func(t *testing.T) { testUDPEcho(t, client) })
-		})
-	}
-}
-
-func TestNowhereInboundMorphMismatch(t *testing.T) {
-	plainPort := startTestServer(t)
-	morphPort := startTestServerConfig(t, LC.NowhereServer{
-		Enable:               true,
-		Listen:               "127.0.0.1:0",
-		Password:             testPassword,
-		Certificate:          testCertificate,
-		PrivateKey:           testPrivateKey,
-		ALPN:                 []string{"nw2"},
-		CongestionController: "bbr",
-		Morph:                true,
-	})
-	metadata := &C.Metadata{Host: "example.com", DstPort: 80}
-
-	on := true
-	morphClient := newTestClientOpt(t, plainPort, "tcp", "tcp", &on)
-	ctxMorph, cancelMorph := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelMorph()
-	if _, err := morphClient.DialContext(ctxMorph, metadata); err == nil {
-		t.Fatal("morph client dialed a morph=0 server")
-	}
-	plainClient := newTestClient(t, morphPort, "tcp", "tcp")
-	ctxPlain, cancelPlain := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelPlain()
-	if _, err := plainClient.DialContext(ctxPlain, metadata); err == nil {
-		t.Fatal("morph=0 client dialed a morph server")
-	}
+// TestNowhereV3TCPForwardingMorphOff is the same pair with Morph explicitly
+// disabled on both ends, which is the escape hatch when a middlebox dislikes
+// the transform.
+func TestNowhereV3TCPForwardingMorphOff(t *testing.T) {
+	port := startNw3TestServer(t, nwtransport.NowhereNetTCP, false)
+	client := newNw3TestClient(t, port, nwtransport.NowhereNetTCP, false)
+	testNw3Forwarding(t, client)
 }

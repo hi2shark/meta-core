@@ -13,7 +13,7 @@ import (
 )
 
 func TestNowhereDestinationBuildsTypedTargets(t *testing.T) {
-	n := &Nowhere{}
+	n := &NowhereV2{}
 
 	tests := []struct {
 		name     string
@@ -119,11 +119,11 @@ func (r *recordedBundle) Close() error { return nil }
 // bundle unresolved: no local DNS lookup happens and an unresolvable host is
 // not rejected with "can't resolve ip".
 func TestNowhereListenPacketKeepsDomainTarget(t *testing.T) {
-	n, err := NewNowhere(NowhereOption{
-		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret",
+	n, err := NewNowhereV2(NowhereOption{
+		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret", ALPN: []string{"nw2"},
 	})
 	if err != nil {
-		t.Fatalf("NewNowhere: %v", err)
+		t.Fatalf("NewNowhereV2: %v", err)
 	}
 
 	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -151,32 +151,32 @@ func TestNowhereListenPacketKeepsDomainTarget(t *testing.T) {
 // away at construction: it must neither fail validation nor reach the dial
 // path (where PeerCertificatePinVerifier would reject it).
 func TestNowherePinNoneDisablesPinning(t *testing.T) {
-	n, err := NewNowhere(NowhereOption{
-		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret",
+	n, err := NewNowhereV2(NowhereOption{
+		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret", ALPN: []string{"nw2"},
 		Pin: "none",
 	})
 	if err != nil {
-		t.Fatalf("NewNowhere: %v", err)
+		t.Fatalf("NewNowhereV2: %v", err)
 	}
 	if n.option.Pin != "" {
 		t.Fatalf("option.Pin = %q, want normalized empty", n.option.Pin)
 	}
-	if _, err := NewNowhere(NowhereOption{
-		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret",
+	if _, err := NewNowhereV2(NowhereOption{
+		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret", ALPN: []string{"nw2"},
 		Pin: "not-hex",
 	}); err == nil {
-		t.Fatal("NewNowhere with invalid pin: want error")
+		t.Fatal("NewNowhereV2 with invalid pin: want error")
 	}
 }
 
 func TestNowherePoolMatchesRustV17Semantics(t *testing.T) {
 	tooLarge := nowhere.MaxPoolSize + 1
-	n, err := NewNowhere(NowhereOption{
-		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret",
+	n, err := NewNowhereV2(NowhereOption{
+		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret", ALPN: []string{"nw2"},
 		Up: "tcp", Down: "tcp", Pool: &tooLarge,
 	})
 	if err != nil {
-		t.Fatalf("NewNowhere tcp/tcp: %v", err)
+		t.Fatalf("NewNowhereV2 tcp/tcp: %v", err)
 	}
 	bundle, ok := n.bundle.(*nowhere.CarrierBundle)
 	if !ok {
@@ -190,12 +190,12 @@ func TestNowherePoolMatchesRustV17Semantics(t *testing.T) {
 	// Rust parses pool only for tcp/tcp, so even a value that would be invalid
 	// for a TCP pool is ignored when either carrier is UDP.
 	negative := -1
-	n, err = NewNowhere(NowhereOption{
-		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret",
+	n, err = NewNowhereV2(NowhereOption{
+		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret", ALPN: []string{"nw2"},
 		Up: "udp", Down: "udp", Pool: &negative,
 	})
 	if err != nil {
-		t.Fatalf("NewNowhere udp/udp with ignored pool: %v", err)
+		t.Fatalf("NewNowhereV2 udp/udp with ignored pool: %v", err)
 	}
 	_ = n.Close()
 }
@@ -208,10 +208,10 @@ func TestNormalizeNowhereALPN(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "omitted defaults", want: defaultNowhereALPN},
-		{name: "explicit protocol", input: []string{"now/1"}, want: "now/1"},
+		{name: "explicit protocol", input: []string{"nw2"}, want: "nw2"},
 		{name: "empty list", input: []string{}, wantErr: true},
 		{name: "empty protocol", input: []string{""}, wantErr: true},
-		{name: "multiple protocols", input: []string{"now/1", "h3"}, wantErr: true},
+		{name: "multiple protocols", input: []string{"nw2", "h3"}, wantErr: true},
 		{name: "overlong protocol", input: []string{strings.Repeat("x", 256)}, wantErr: true},
 	}
 
@@ -239,12 +239,12 @@ func TestNowhereMuxAndMixConstruction(t *testing.T) {
 	muxBad := 2
 	poolFive := 5
 
-	n, err := NewNowhere(NowhereOption{
-		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret",
+	n, err := NewNowhereV2(NowhereOption{
+		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret", ALPN: []string{"nw2"},
 		Up: "tcp", Down: "tcp", Mux: &muxOne, Pool: &poolFive,
 	})
 	if err != nil {
-		t.Fatalf("NewNowhere mux=1: %v", err)
+		t.Fatalf("NewNowhereV2 mux=1: %v", err)
 	}
 	bundle, ok := n.bundle.(*nowhere.CarrierBundle)
 	if !ok {
@@ -260,19 +260,19 @@ func TestNowhereMuxAndMixConstruction(t *testing.T) {
 
 	// mix is not a carrier since Nowhere 2.2: the client policy was dropped
 	// together with the core's MixUp/MixDown, so mix/mix must be rejected.
-	if _, err := NewNowhere(NowhereOption{
-		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret",
+	if _, err := NewNowhereV2(NowhereOption{
+		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret", ALPN: []string{"nw2"},
 		Up: "mix", Down: "mix",
 	}); err == nil {
-		t.Fatal("NewNowhere mix/mix: want error")
+		t.Fatal("NewNowhereV2 mix/mix: want error")
 	} else if !strings.Contains(err.Error(), "must be tcp or udp") {
-		t.Fatalf("NewNowhere mix/mix error = %v, want \"must be tcp or udp\"", err)
+		t.Fatalf("NewNowhereV2 mix/mix error = %v, want \"must be tcp or udp\"", err)
 	}
 
-	if _, err := NewNowhere(NowhereOption{
-		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret",
+	if _, err := NewNowhereV2(NowhereOption{
+		Name: "nw-test", Server: "example.com", Port: 2077, Password: "secret", ALPN: []string{"nw2"},
 		Mux: &muxBad,
 	}); err == nil {
-		t.Fatal("NewNowhere mux=2: want error")
+		t.Fatal("NewNowhereV2 mux=2: want error")
 	}
 }
