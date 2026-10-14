@@ -106,11 +106,21 @@ type NowhereOption struct {
 	CongestionController string `proxy:"congestion-controller,omitempty"`
 	CWND                 int    `proxy:"cwnd,omitempty"`
 
+	// Version selects the Nowhere protocol stack: 2 (default, the full carrier
+	// matrix above) or 3 (one carrier, no multiplexing, see nowhere_v3.go).
+	// An omitted value resolves to 2 so every pre-nw3 configuration keeps
+	// working unchanged.
+	Version int `proxy:"version,omitempty"`
+	// Carrier is the single Nowhere 3 transport: "tcp" (TLS over TCP, default)
+	// or "quic". It only applies to version 3.
+	Carrier string `proxy:"carrier,omitempty"`
+
 	UDP bool `proxy:"udp,omitempty"`
 	// Morph enables the Nowhere 2 keyed socket transform below TLS/QUIC
 	// (official CLI morph=1). YAML true/1 enable it; omitted/false/0 is morph=0.
-	// There is no negotiation: the Portal must use the same setting.
-	Morph bool `proxy:"morph,omitempty"`
+	// There is no negotiation: the Portal must use the same setting. Nowhere 3
+	// defaults the other way (on when omitted) — see nowhere_v3.go.
+	Morph *bool `proxy:"morph,omitempty"`
 }
 
 // DialContext implements C.ProxyAdapter.
@@ -183,14 +193,32 @@ func (n *Nowhere) destination(metadata *C.Metadata) (nowhere.Target, error) {
 	return nowhere.Target{}, errors.New("nowhere: empty destination")
 }
 
-// NewNowhere builds a Nowhere outbound from its option map.
+// NewNowhere builds a Nowhere outbound from its option map. The version is
+// resolved first: 2 (the default) keeps the full carrier matrix here, 3 hands
+// the option to the Nowhere 3 outbound, which speaks one carrier.
 func NewNowhere(option NowhereOption) (*Nowhere, error) {
+	version, err := nowhere.ResolveNowhereVersion(option.Version)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere %s: %w", option.Name, err)
+	}
+	if version == nowhere.NowhereVersion3 {
+		return nil, errNowhereV3Dispatched
+	}
+	return newNowhereV2(option)
+}
+
+// errNowhereV3Dispatched marks the version-3 path: NewNowhere dispatches to
+// NewNowhereV3, so reaching this error means the caller ignored the version.
+var errNowhereV3Dispatched = errors.New("nowhere: version 3 must be built by NewNowhereV3")
+
+func newNowhereV2(option NowhereOption) (*Nowhere, error) {
 	if option.Password == "" {
 		return nil, fmt.Errorf("nowhere %s: missing password", option.Name)
 	}
 	if option.Port <= 0 {
 		return nil, fmt.Errorf("nowhere %s: invalid port %d", option.Name, option.Port)
 	}
+	morph := nowhere.ResolveNowhereMorph(option.Morph, nowhere.NowhereVersion2)
 	policy, err := nowhere.ResolveRoutePolicy(nowhere.RouteInputs{
 		Prefix: fmt.Sprintf("nowhere %s", option.Name),
 		Up:     option.Up,
@@ -290,7 +318,7 @@ func NewNowhere(option NowhereOption) (*Nowhere, error) {
 		ServerName: serverName,
 		TLSConfig:  tlsConfig,
 		QUICConfig: quicConfig,
-		Dialer:     nowhere.WrapMorphPacketDialer(n.dialer, string(nowhere.MorphSharedKey(option.Morph, option.Password))),
+		Dialer:     nowhere.WrapMorphPacketDialer(n.dialer, string(nowhere.MorphSharedKey(morph, option.Password))),
 		Congestion: orDefault(option.CongestionController, "bbr"),
 		CWND:       orInt(option.CWND, 32),
 		Observer:   nowhere.MihomoObserver{},
@@ -316,7 +344,7 @@ func NewNowhere(option NowhereOption) (*Nowhere, error) {
 			MaxConcurrentDials: derefInt(option.MaxConcurrentDials),
 			WarmBackoffInitial: secondsPtr(option.WarmBackoffInitial),
 			WarmBackoffMax:     secondsPtr(option.WarmBackoffMax),
-			MorphSharedKey:     nowhere.MorphSharedKey(option.Morph, option.Password),
+			MorphSharedKey:     nowhere.MorphSharedKey(morph, option.Password),
 		})
 		if err != nil {
 			return nil, err

@@ -63,3 +63,54 @@ func (n NowhereServer) String() string {
 	b, _ := json.Marshal(n)
 	return string(b)
 }
+
+// NowhereServerV3 is the Nowhere 3 (nw3) Portal listener configuration. The
+// vendored Portal owns its own handshake, so — unlike the Nowhere 2 server —
+// there is no next-hop chaining, no ECH key and no admission-limit knob: ALPN
+// is pinned to nw3 and TLS to 1.3.
+type NowhereServerV3 struct {
+	Enable               bool   `yaml:"enable" json:"enable"`
+	Listen               string `yaml:"listen" json:"listen"`
+	Password             string `yaml:"password" json:"password"`
+	Certificate          string `yaml:"certificate" json:"certificate"`
+	PrivateKey           string `yaml:"private-key" json:"private-key"`
+	CongestionController string `yaml:"congestion-controller" json:"congestion-controller,omitempty"`
+	CWND                 int    `yaml:"cwnd" json:"cwnd,omitempty"`
+	// Carrier is the single Nowhere 3 transport: tcp (TLS over TCP) or quic.
+	Carrier string `yaml:"carrier" json:"carrier,omitempty"`
+	// Egress turns the Portal into an exit bridge: it accepts a single Egress
+	// registration over QUIC (see NowhereEgress) and forwards every
+	// authenticated flow there instead of to the local tunnel. It requires the
+	// quic carrier, because the registration handshake only exists there.
+	Egress bool `yaml:"egress" json:"egress,omitempty"`
+	// Morph enables the Nowhere 3 keyed transform below TLS/QUIC. The inbound
+	// option layer resolves the per-version default (off for 2, on for 3).
+	Morph bool `yaml:"morph" json:"morph,omitempty"`
+}
+
+func (n NowhereServerV3) String() string {
+	b, _ := json.Marshal(n)
+	return string(b)
+}
+
+// NowhereEgress is the Nowhere 3 Egress exit configuration. It never listens:
+// it dials a Portal over QUIC, registers as that Portal's single exit, and
+// serves the flows the Portal opens through the tunnel.
+type NowhereEgress struct {
+	Enable               bool   `yaml:"enable" json:"enable"`
+	Server               string `yaml:"server" json:"server"`
+	Port                 int    `yaml:"port" json:"port"`
+	Password             string `yaml:"password" json:"password"`
+	SNI                  string `yaml:"sni" json:"sni,omitempty"`
+	Pin                  string `yaml:"pin" json:"pin,omitempty"`
+	SkipCertVerify       bool   `yaml:"skip-cert-verify" json:"skip-cert-verify,omitempty"`
+	CongestionController string `yaml:"congestion-controller" json:"congestion-controller,omitempty"`
+	CWND                 int    `yaml:"cwnd" json:"cwnd,omitempty"`
+	// Morph enables the Nowhere 3 keyed transform below QUIC towards the Portal.
+	Morph bool `yaml:"morph" json:"morph,omitempty"`
+}
+
+func (n NowhereEgress) String() string {
+	b, _ := json.Marshal(n)
+	return string(b)
+}

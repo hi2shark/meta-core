@@ -53,10 +53,10 @@ func (t *countingTunnel) calls() int32 { return t.tcp.Load() + t.udp.Load() }
 // chaining, Nowhere 1.7). up/down/pin configure the next hop towards the
 // origin; an empty up/down pair exercises the udp/udp default.
 func startRelayServer(t *testing.T, originPort int, up, down, pin string) (int, *countingTunnel) {
-	return startRelayServerOpt(t, originPort, up, down, pin, false, nil)
+	return startRelayServerOpt(t, originPort, up, down, pin, nil, nil)
 }
 
-func startRelayServerOpt(t *testing.T, originPort int, up, down, pin string, morph bool, nextMorph *bool) (int, *countingTunnel) {
+func startRelayServerOpt(t *testing.T, originPort int, up, down, pin string, morph *bool, nextMorph *bool) (int, *countingTunnel) {
 	t.Helper()
 	tunnel := &countingTunnel{}
 	relay, err := IN.NewNowhere(&IN.NowhereOption{
@@ -368,6 +368,7 @@ func TestNowhereInboundMux(t *testing.T) {
 }
 
 func TestNowhereInboundChainMorph(t *testing.T) {
+	on := true
 	originPort := startTestServerConfig(t, LC.NowhereServer{
 		Enable:               true,
 		Listen:               "127.0.0.1:0",
@@ -378,14 +379,14 @@ func TestNowhereInboundChainMorph(t *testing.T) {
 		CongestionController: "bbr",
 		Morph:                true,
 	})
-	relayPort, tunnel := startRelayServerOpt(t, originPort, "tcp", "tcp", testNextPin, true, nil)
-	client := newTestClientOpt(t, relayPort, "tcp", "tcp", true)
+	relayPort, tunnel := startRelayServerOpt(t, originPort, "tcp", "tcp", testNextPin, &on, nil)
+	client := newTestClientOpt(t, relayPort, "tcp", "tcp", &on)
 	testTCPEcho(t, client)
 	testUDPEcho(t, client)
 	assertTunnelUnused(t, tunnel)
 
-	relayUDPPort, tunnelUDP := startRelayServerOpt(t, originPort, "udp", "udp", testNextPin, true, nil)
-	clientUDP := newTestClientOpt(t, relayUDPPort, "udp", "udp", true)
+	relayUDPPort, tunnelUDP := startRelayServerOpt(t, originPort, "udp", "udp", testNextPin, &on, nil)
+	clientUDP := newTestClientOpt(t, relayUDPPort, "udp", "udp", &on)
 	testTCPEcho(t, clientUDP)
 	testUDPEcho(t, clientUDP)
 	assertTunnelUnused(t, tunnelUDP)
@@ -394,8 +395,9 @@ func TestNowhereInboundChainMorph(t *testing.T) {
 func TestNowhereInboundChainMorphNextOverride(t *testing.T) {
 	originPort := startTestServer(t)
 	off := false
-	relayPort, tunnel := startRelayServerOpt(t, originPort, "tcp", "tcp", testNextPin, true, &off)
-	client := newTestClientOpt(t, relayPort, "tcp", "tcp", true)
+	on := true
+	relayPort, tunnel := startRelayServerOpt(t, originPort, "tcp", "tcp", testNextPin, &on, &off)
+	client := newTestClientOpt(t, relayPort, "tcp", "tcp", &on)
 	testTCPEcho(t, client)
 	testUDPEcho(t, client)
 	assertTunnelUnused(t, tunnel)

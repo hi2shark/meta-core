@@ -1,6 +1,7 @@
 package inbound
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"net/url"
@@ -24,9 +25,24 @@ type NowhereOption struct {
 	CWND                 int      `inbound:"cwnd,omitempty"`
 	// Morph enables the Nowhere 2 keyed socket transform below TLS/QUIC
 	// (official CLI morph=1). YAML true/1 enable it; omitted/false/0 is morph=0.
-	// There is no negotiation: the client must use the same setting.
-	Morph bool               `inbound:"morph,omitempty"`
+	// There is no negotiation: the client must use the same setting. Nowhere 3
+	// defaults the other way (on when omitted) — see ResolveNowhereMorph.
+	Morph *bool              `inbound:"morph,omitempty"`
 	Next  *NowhereNextOption `inbound:"next,omitempty"`
+
+	// Version selects the Nowhere protocol stack: 2 (default, the listener in
+	// listener/nowhere/server.go) or 3 (listener/nowhere/v3.go). An omitted
+	// value resolves to 2 so every pre-nw3 configuration keeps working
+	// unchanged.
+	Version int `inbound:"version,omitempty"`
+	// Carrier is the single Nowhere 3 transport: "tcp" (TLS over TCP, default)
+	// or "quic". It only applies to version 3.
+	Carrier string `inbound:"carrier,omitempty"`
+	// Egress turns the Nowhere 3 Portal into an exit bridge: it accepts a single
+	// Egress registration (see the nowhere-egress inbound) and forwards every
+	// authenticated flow there instead of to the local tunnel. It requires
+	// version 3 on the quic carrier.
+	Egress bool `inbound:"egress,omitempty"`
 }
 
 // NowhereNextOption is the next-hop Portal for native Portal chaining
@@ -78,7 +94,25 @@ type Nowhere struct {
 	ts     LC.NowhereServer
 }
 
+// NewNowhere builds the Nowhere inbound. The version is resolved first: 2 (the
+// default) keeps the full listener here, 3 hands the option to the Nowhere 3
+// listener, which speaks one carrier and owns its own handshake.
 func NewNowhere(options *NowhereOption) (*Nowhere, error) {
+	version, err := nwtransport.ResolveNowhereVersion(options.Version)
+	if err != nil {
+		return nil, fmt.Errorf("nowhere %s: %w", options.Name(), err)
+	}
+	if version == nwtransport.NowhereVersion3 {
+		return nil, errNowhereV3Dispatched
+	}
+	return newNowhereV2(options)
+}
+
+// errNowhereV3Dispatched marks the version-3 path: NewNowhere dispatches to
+// NewNowhereV3, so reaching this error means the caller ignored the version.
+var errNowhereV3Dispatched = errors.New("nowhere: version 3 must be built by NewNowhereV3")
+
+func newNowhereV2(options *NowhereOption) (*Nowhere, error) {
 	if options.Password == "" {
 		return nil, fmt.Errorf("nowhere %s: missing password", options.Name())
 	}
@@ -106,6 +140,7 @@ func NewNowhere(options *NowhereOption) (*Nowhere, error) {
 	if err := validateNowhereNext(options.Name(), options.Next); err != nil {
 		return nil, err
 	}
+	morph := nwtransport.ResolveNowhereMorph(options.Morph, nwtransport.NowhereVersion2)
 	base, err := NewBase(&options.BaseOption)
 	if err != nil {
 		return nil, err
@@ -123,8 +158,8 @@ func NewNowhere(options *NowhereOption) (*Nowhere, error) {
 			ALPN:                 options.ALPN,
 			CongestionController: options.CongestionController,
 			CWND:                 options.CWND,
-			Morph:                options.Morph,
-			Next:                 nowhereNextConfig(options.Next, options.Morph),
+			Morph:                morph,
+			Next:                 nowhereNextConfig(options.Next, morph),
 		},
 	}, nil
 }
@@ -220,8 +255,8 @@ func decodeNowherePortalKey(field, key, name string) (string, error) {
 }
 
 func nowherePortalKeyError(name, field string) error {
-	return fmt.Errorf("nowhere %s: %s: shared key must be %d–%d lowercase hexadecimal characters; use mihomo nowhere generate-key",
-		name, field, nowherePortalKeyMinLen, nowherePortalKeyMaxLen)
+	return fmt.Errorf("nowhere %s: %s: shared key must be %d–%d lowercase hexadecimal characters (openssl rand -hex %d is a quick way to make one)",
+		name, field, nowherePortalKeyMinLen, nowherePortalKeyMaxLen, nowherePortalKeyMinLen/2)
 }
 
 // validNowhereSNI mirrors the Rust sni rule (vector/config.rs): an explicit

@@ -6,6 +6,7 @@ import (
 	"github.com/metacubex/mihomo/common/structure"
 	C "github.com/metacubex/mihomo/constant"
 	IN "github.com/metacubex/mihomo/listener/inbound"
+	nwtransport "github.com/metacubex/mihomo/transport/nowhere"
 )
 
 func ParseListener(mapping map[string]any) (C.InboundListener, error) {
@@ -156,14 +157,35 @@ func ParseListener(mapping map[string]any) (C.InboundListener, error) {
 		listener, err = IN.NewAnyTLS(anytlsOption)
 	case "nowhere":
 		nowhereOption := &IN.NowhereOption{
-			ALPN:                 []string{"nw2"},
 			CongestionController: "bbr",
 		}
 		err = decoder.Decode(mapping, nowhereOption)
 		if err != nil {
 			return nil, err
 		}
-		listener, err = IN.NewNowhere(nowhereOption)
+		// The version is resolved here so an unsupported value fails with the
+		// listener's own message before the nw2-only defaults above are applied.
+		version, versionErr := nwtransport.ResolveNowhereVersion(nowhereOption.Version)
+		if versionErr != nil {
+			return nil, fmt.Errorf("nowhere %s: %w", nowhereOption.Name(), versionErr)
+		}
+		if version == nwtransport.NowhereVersion3 {
+			listener, err = IN.NewNowhereV3(nowhereOption)
+		} else {
+			// The nw2 ALPN default is applied after the decode (and only on the
+			// nw2 path) so the nw3 validator never sees it: nw3 fixes alpn.
+			if len(nowhereOption.ALPN) == 0 {
+				nowhereOption.ALPN = []string{"nw2"}
+			}
+			listener, err = IN.NewNowhere(nowhereOption)
+		}
+	case "nowhere-egress":
+		nowhereEgressOption := &IN.NowhereEgressOption{}
+		err = decoder.Decode(mapping, nowhereEgressOption)
+		if err != nil {
+			return nil, err
+		}
+		listener, err = IN.NewNowhereEgress(nowhereEgressOption)
 	case "mieru":
 		mieruOption := &IN.MieruOption{}
 		err = decoder.Decode(mapping, mieruOption)

@@ -39,5 +39,5 @@ func DecodePortalKey(key string) (string, error) {
 	return decoded, nil
 }
 
-var errPortalKeyFormat = fmt.Errorf("shared key must be %d–%d lowercase hexadecimal characters; use mihomo nowhere generate-key",
-	PortalKeyMinLen, PortalKeyMaxLen)
+var errPortalKeyFormat = fmt.Errorf("shared key must be %d–%d lowercase hexadecimal characters (openssl rand -hex %d is a quick way to make one)",
+	PortalKeyMinLen, PortalKeyMaxLen, PortalKeyMinLen/2)

@@ -6,6 +6,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/common/structure"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/transport/nowhere"
 )
 
 func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error) {
@@ -232,7 +233,18 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		if _, ok := mapping["udp"]; !ok {
 			nowhereOption.UDP = true
 		}
-		proxy, err = outbound.NewNowhere(*nowhereOption)
+		// The version is resolved here so the proxy-level decode of an
+		// unsupported value fails with the outbound's own message.
+		version, versionErr := nowhere.ResolveNowhereVersion(nowhereOption.Version)
+		if versionErr != nil {
+			err = versionErr
+			break
+		}
+		if version == nowhere.NowhereVersion3 {
+			proxy, err = outbound.NewNowhereV3(*nowhereOption)
+		} else {
+			proxy, err = outbound.NewNowhere(*nowhereOption)
+		}
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}

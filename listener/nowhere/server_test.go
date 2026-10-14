@@ -82,10 +82,10 @@ func startTestServerConfig(t *testing.T, cfg LC.NowhereServer) int {
 }
 
 func newTestClient(t *testing.T, port int, up, down string) *outbound.Nowhere {
-	return newTestClientOpt(t, port, up, down, false)
+	return newTestClientOpt(t, port, up, down, nil)
 }
 
-func newTestClientOpt(t *testing.T, port int, up, down string, morph bool) *outbound.Nowhere {
+func newTestClientOpt(t *testing.T, port int, up, down string, morph *bool) *outbound.Nowhere {
 	t.Helper()
 	client, err := outbound.NewNowhere(outbound.NowhereOption{
 		Name: "nowhere-test-client", Server: "127.0.0.1", Port: port,
@@ -277,7 +277,7 @@ func TestParseListenerNowhere(t *testing.T) {
 	if !ok {
 		t.Fatalf("Config() = %T, want *inbound.NowhereOption", parsedMorph.Config())
 	}
-	if !optionMorph.Morph {
+	if optionMorph.Morph == nil || !*optionMorph.Morph {
 		t.Fatal("Morph = false, want true for morph: 1")
 	}
 }
@@ -293,10 +293,11 @@ func TestNowhereInboundMorph(t *testing.T) {
 		CongestionController: "bbr",
 		Morph:                true,
 	})
+	on := true
 	for _, carriers := range [][2]string{{"tcp", "tcp"}, {"udp", "udp"}, {"tcp", "udp"}, {"udp", "tcp"}} {
 		up, down := carriers[0], carriers[1]
 		t.Run(up+"/"+down, func(t *testing.T) {
-			client := newTestClientOpt(t, port, up, down, true)
+			client := newTestClientOpt(t, port, up, down, &on)
 			t.Run("tcp echo", func(t *testing.T) { testTCPEcho(t, client) })
 			t.Run("udp echo", func(t *testing.T) { testUDPEcho(t, client) })
 		})
@@ -317,7 +318,8 @@ func TestNowhereInboundMorphMismatch(t *testing.T) {
 	})
 	metadata := &C.Metadata{Host: "example.com", DstPort: 80}
 
-	morphClient := newTestClientOpt(t, plainPort, "tcp", "tcp", true)
+	on := true
+	morphClient := newTestClientOpt(t, plainPort, "tcp", "tcp", &on)
 	ctxMorph, cancelMorph := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelMorph()
 	if _, err := morphClient.DialContext(ctxMorph, metadata); err == nil {
