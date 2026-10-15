@@ -1,0 +1,331 @@
+package nowhere
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
+	tlsC "github.com/metacubex/mihomo/component/tls"
+	LC "github.com/metacubex/mihomo/listener/config"
+	"github.com/metacubex/mihomo/log"
+	nwtransport "github.com/metacubex/mihomo/transport/nowhere"
+	"github.com/metacubex/mihomo/transport/vmess"
+
+	nwserver "github.com/metacubex/mihomo/transport/nowhere/core/nw2/server"
+
+	"github.com/metacubex/quic-go"
+	"github.com/metacubex/tls"
+)
+
+// Native Portal chaining. When the listener config carries a next section,
+// the inbound forwards every authenticated flow to another Nowhere 2 Portal
+// through a client-side CarrierBundle wrapped in
+// nwserver.PortalUpstream, bypassing the tunnel entirely.
+
+// newPortalUpstream builds the next-hop client bundle for a chained Portal
+// and wraps it as the inbound Upstream. The bundle shares the listener ALPN
+// (Rust contract: a chained Portal presents the listener ALPN upstream) and
+// uses the listener congestion-controller/cwnd for its QUIC backend.
+//
+// The returned bundle is caller-owned: PortalUpstream borrows it without
+// taking ownership, so close ServerV2 using the Upstream first and the
+// bundle second.
+func newPortalUpstream(next *LC.NowhereNextV2, alpn, congestionController string, cwnd int) (*nwserver.PortalUpstream, *nwtransport.CarrierBundle, error) {
+	policy, err := resolvePortalNext(next)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	addr := net.JoinHostPort(next.Server, strconv.Itoa(next.Port))
+	serverName := next.Server
+	if next.SNI != "" {
+		serverName = next.SNI
+	}
+	// Rust contract (Nowhere docs/configuration.md): an omitted/empty sni
+	// disables certificate verification, while serverName is still sent as
+	// ClientHello SNI for virtual-host routing; an explicit sni keeps
+	// chain+name verification on; pin overrides both.
+	skipCertVerify := next.SNI == "" || next.Pin != ""
+
+	credentials, err := nwtransport.NewCredentials(next.Password)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	dialPolicy, err := nwtransport.ParseDialPolicy("", next.Dial4, next.Dial6)
+	if err != nil {
+		return nil, nil, fmt.Errorf("nowhere: next: %w", err)
+	}
+
+	// The chained hop always dials directly; the schema exposes no
+	// interface/routing-mark/dialer-proxy options.
+	portalDialer := nwtransport.NewSourceBoundDialer(dialPolicy, dialer.NewDialer())
+
+	bundleCfg := nwtransport.BundleOptions{
+		Credentials: credentials, ALPN: alpn, Observer: nwtransport.MihomoObserver{},
+		PoolSize: policy.PoolSize,
+		Up:       policy.UpCarrier(),
+		Down:     policy.DownCarrier(),
+		Mux:      policy.Mux,
+	}
+	if policy.UsesQUIC {
+		tlsConfig, err := portalQUICTLSConfig(serverName, alpn, skipCertVerify, next.Pin)
+		if err != nil {
+			return nil, nil, err
+		}
+		bundleCfg.QUIC = nwtransport.NewQuicBackend(&nwtransport.QUICConfig{
+			Addr:       addr,
+			ServerName: serverName,
+			TLSConfig:  tlsConfig,
+			QUICConfig: &quic.Config{
+				EnableDatagrams:                true,
+				Allow0RTT:                      false,
+				KeepAlivePeriod:                0,
+				MaxIdleTimeout:                 120 * time.Second, // mirror the nowhere outbound client
+				MaxIncomingStreams:             -1,
+				MaxIncomingUniStreams:          -1,
+				InitialStreamReceiveWindow:     nwtransport.RecommendedStreamReceiveWindow,
+				MaxStreamReceiveWindow:         nwtransport.RecommendedStreamReceiveWindow,
+				InitialConnectionReceiveWindow: nwtransport.RecommendedConnectionReceiveWindow,
+				MaxConnectionReceiveWindow:     nwtransport.RecommendedConnectionReceiveWindow,
+			},
+			Dialer:     nwtransport.WrapMorphPacketDialer(portalDialer, string(nwtransport.MorphSharedKey(next.Morph, next.Password))),
+			Congestion: congestionController,
+			CWND:       cwnd,
+			Observer:   nwtransport.MihomoObserver{},
+		})
+	}
+	if policy.UsesTCP {
+		tlsConfig := portalTCPTLSConfig(serverName, alpn, skipCertVerify)
+		var tlsDialer nwtransport.TLSDialer = &vmessTLSDialer{cfg: tlsConfig}
+		if next.Pin != "" {
+			tlsDialer = &pinTLSDialer{cfg: tlsConfig, pin: next.Pin}
+		}
+		bundleCfg.TCP, err = nwtransport.NewTCPConfig(nwtransport.TCPOptions{
+			Address:        addr,
+			ConnectAddress: addr, // direct dialer resolves the host
+			Dialer:         portalDialer,
+			TLSDialer:      tlsDialer,
+			Observer:       nwtransport.MihomoObserver{},
+			MorphSharedKey: nwtransport.MorphSharedKey(next.Morph, next.Password),
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	bundle, err := nwtransport.NewCarrierBundle(bundleCfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	portalUpstream, err := nwserver.NewPortalUpstream(bundle)
+	if err != nil {
+		_ = bundle.Close()
+		return nil, nil, err
+	}
+	return portalUpstream, bundle, nil
+}
+
+// resolvePortalNext validates the next section and resolves carrier, mux, and
+// pool defaults, mirroring the outbound's ResolveRoutePolicy rules.
+func resolvePortalNext(next *LC.NowhereNextV2) (nwtransport.RoutePolicy, error) {
+	// Rust contract (vector/config.rs): the literal "none" is an alias for an
+	// omitted sni/pin; normalize in place so a directly constructed
+	// LC.NowhereServerV2 (bypassing the inbound option layer) behaves the same.
+	next.SNI = normalizePortalNone(next.SNI)
+	next.Pin = normalizePortalNone(next.Pin)
+	if next.Server == "" {
+		return nwtransport.RoutePolicy{}, errors.New("nowhere: next: missing server")
+	}
+	// Rust parses the port as u16.
+	if next.Port <= 0 || next.Port > 65535 {
+		return nwtransport.RoutePolicy{}, fmt.Errorf("nowhere: next: invalid port %d", next.Port)
+	}
+	if next.Password == "" {
+		return nwtransport.RoutePolicy{}, errors.New("nowhere: next: missing password")
+	}
+	policy, err := nwtransport.ResolveRoutePolicy(nwtransport.RouteInputs{
+		Prefix: "nowhere: next",
+		Up:     next.Up,
+		Down:   next.Down,
+		Pool:   next.Pool,
+		Mux:    next.Mux,
+		Warn: func(format string, args ...any) {
+			log.Warnln("[Nowhere] next "+format, args...)
+		},
+	})
+	if err != nil {
+		return nwtransport.RoutePolicy{}, err
+	}
+	if _, err := nwtransport.ParseDialPolicy("", next.Dial4, next.Dial6); err != nil {
+		return nwtransport.RoutePolicy{}, fmt.Errorf("nowhere: next: %w", err)
+	}
+	if next.SNI != "" && !validPortalSNI(next.SNI) {
+		return nwtransport.RoutePolicy{}, errors.New("nowhere: next: sni must be an ASCII DNS name")
+	}
+	if next.Pin != "" {
+		if _, err := nwtransport.ParseCertificatePin(next.Pin); err != nil {
+			return nwtransport.RoutePolicy{}, fmt.Errorf("nowhere: next: %w", err)
+		}
+	}
+	return policy, nil
+}
+
+// normalizePortalNone maps the Rust "none" sentinel for sni/pin onto the
+// empty value, which the listener treats as unset.
+func normalizePortalNone(value string) string {
+	if value == "none" {
+		return ""
+	}
+	return value
+}
+
+// validPortalSNI mirrors the Rust sni rule (vector/config.rs): an explicit
+// sni must be an ASCII DNS name — at most 253 bytes, no ':'/'['/']', and not
+// an IP literal.
+func validPortalSNI(sni string) bool {
+	if len(sni) > 253 || strings.ContainsAny(sni, ":[]") {
+		return false
+	}
+	for i := 0; i < len(sni); i++ {
+		if sni[i] > 0x7f {
+			return false
+		}
+	}
+	if _, err := netip.ParseAddr(sni); err == nil {
+		return false
+	}
+	return true
+}
+
+// portalQUICTLSConfig mirrors the outbound's QUIC TLS policy: TLS 1.3 with the
+// shared one-ALPN profile; pin overrides SNI/chain verification.
+func portalQUICTLSConfig(serverName, alpn string, skipCertVerify bool, pin string) (*tls.Config, error) {
+	tlsConfig, err := ca.GetTLSConfig(ca.Option{
+		TLSConfig: &tls.Config{
+			ServerName:         serverName,
+			InsecureSkipVerify: skipCertVerify,
+			MinVersion:         tls.VersionTLS13,
+			NextProtos:         []string{alpn},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if pin != "" {
+		verifier, err := nwtransport.PeerCertificatePinVerifier(pin)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.InsecureSkipVerify = true
+		tlsConfig.VerifyPeerCertificate = verifier
+	}
+	return tlsConfig, nil
+}
+
+// portalTCPTLSConfig mirrors the outbound's TCP-carrier TLS policy
+// (effectiveTLS.tcpTLSConfig minus fingerprint/client-cert/ECH, which the
+// next schema does not expose).
+func portalTCPTLSConfig(serverName, alpn string, skipCertVerify bool) *vmess.TLSConfig {
+	return &vmess.TLSConfig{
+		Host:           serverName,
+		SkipCertVerify: skipCertVerify,
+		NextProtos:     []string{alpn},
+		MinVersion:     tls.VersionTLS13,
+	}
+}
+
+// vmessTLSDialer adapts Mihomo's actual TLS handshake and derives the
+// connection-bound exporter, mirroring the outbound's dialer. A TLS engine
+// that cannot expose exporter material is rejected rather than falling back
+// to the retired password-only auth.
+type vmessTLSDialer struct{ cfg *vmess.TLSConfig }
+
+func (t *vmessTLSDialer) DialTLSConn(ctx context.Context, c net.Conn) (nwtransport.HandshakedConn, error) {
+	conn, err := vmess.StreamTLSConn(ctx, c, t.cfg)
+	if err != nil {
+		return nwtransport.HandshakedConn{}, err
+	}
+	var material []byte
+	var version uint16
+	var negotiatedALPN string
+	switch tlsConn := conn.(type) {
+	case *tls.Conn:
+		state := tlsConn.ConnectionState()
+		version = state.Version
+		negotiatedALPN = state.NegotiatedProtocol
+		material, err = state.ExportKeyingMaterial(nwtransport.TLSExporterLabel, nwtransport.EmptyTLSExporterContext(), nwtransport.TLSExporterLen)
+	case *tlsC.UConn:
+		state := tlsConn.ConnectionState()
+		version = state.Version
+		negotiatedALPN = state.NegotiatedProtocol
+		material, err = state.ExportKeyingMaterial(nwtransport.TLSExporterLabel, nwtransport.EmptyTLSExporterContext(), nwtransport.TLSExporterLen)
+	default:
+		err = errors.New("nowhere: selected TLS engine does not expose TLS exporter")
+	}
+	if err != nil {
+		_ = conn.Close()
+		return nwtransport.HandshakedConn{}, err
+	}
+	if len(material) != nwtransport.TLSExporterLen {
+		_ = conn.Close()
+		return nwtransport.HandshakedConn{}, errors.New("nowhere: invalid TLS exporter length")
+	}
+	var exporter nwtransport.TLSExporter
+	copy(exporter[:], material)
+	return nwtransport.HandshakedConn{
+		Conn: conn,
+		TLSHandshakeInfo: nwtransport.TLSHandshakeInfo{
+			TLSVersion: version, NegotiatedALPN: negotiatedALPN, Exporter: exporter,
+		},
+	}, nil
+}
+
+// pinTLSDialer performs a TLS 1.3 handshake with Nowhere leaf-certificate pin
+// verification (overrides SNI/chain checks), mirroring the outbound's dialer.
+type pinTLSDialer struct {
+	cfg *vmess.TLSConfig
+	pin string
+}
+
+func (t *pinTLSDialer) DialTLSConn(ctx context.Context, c net.Conn) (nwtransport.HandshakedConn, error) {
+	tlsConfig, err := t.cfg.ToStdConfig()
+	if err != nil {
+		return nwtransport.HandshakedConn{}, err
+	}
+	verifier, err := nwtransport.PeerCertificatePinVerifier(t.pin)
+	if err != nil {
+		return nwtransport.HandshakedConn{}, err
+	}
+	tlsConfig.InsecureSkipVerify = true
+	tlsConfig.VerifyPeerCertificate = verifier
+	tlsConn := tls.Client(c, tlsConfig)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = tlsConn.Close()
+		return nwtransport.HandshakedConn{}, err
+	}
+	state := tlsConn.ConnectionState()
+	material, err := state.ExportKeyingMaterial(nwtransport.TLSExporterLabel, nwtransport.EmptyTLSExporterContext(), nwtransport.TLSExporterLen)
+	if err != nil {
+		_ = tlsConn.Close()
+		return nwtransport.HandshakedConn{}, err
+	}
+	if len(material) != nwtransport.TLSExporterLen {
+		_ = tlsConn.Close()
+		return nwtransport.HandshakedConn{}, errors.New("nowhere: invalid TLS exporter length")
+	}
+	var exporter nwtransport.TLSExporter
+	copy(exporter[:], material)
+	return nwtransport.HandshakedConn{
+		Conn: tlsConn,
+		TLSHandshakeInfo: nwtransport.TLSHandshakeInfo{
+			TLSVersion: state.Version, NegotiatedALPN: state.NegotiatedProtocol, Exporter: exporter,
+		},
+	}, nil
+}

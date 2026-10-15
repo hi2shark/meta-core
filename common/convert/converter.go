@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/metacubex/mihomo/log"
+	nowhereTransport "github.com/metacubex/mihomo/transport/nowhere"
 )
 
 // ConvertsV2Ray convert V2Ray subscribe proxies data to mihomo proxies config
@@ -706,6 +707,132 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 
 				proxies = append(proxies, mieru)
 			}
+
+		case "nowhere":
+			// nowhere://<key>@host:port?up=tcp|udp&down=tcp|udp&mux=0|1&morph=0|1&sni=...&alpn=...&pool=0..256&insecure=0|1&ech=...#name
+			// Mirrors Anywhere's ProxyConfiguration+URLParsing.parseNowhere. The URL
+			// username is the shared key; a password component is not part of the
+			// Nowhere credential model. `up`/`down` independently select the upload
+			// and download carrier and default to udp/udp.
+			urlNowhere, err := url.Parse(line)
+			if err != nil {
+				continue
+			}
+			query := urlNowhere.Query()
+
+			key := urlNowhere.User.Username()
+			if key == "" {
+				continue
+			}
+			if _, hasPassword := urlNowhere.User.Password(); hasPassword {
+				// A password component is not part of the Nowhere credential model.
+				continue
+			}
+
+			up := query.Get("up")
+			down := query.Get("down")
+			if (up == "") != (down == "") {
+				// One-sided up/down is ambiguous; reject rather than guess.
+				// Do not log the raw URI (it contains the shared key).
+				log.Warnln("nowhere share-link: up and down must both be set or both omitted")
+				continue
+			}
+			if up == "" && down == "" {
+				up, down = "udp", "udp"
+			}
+			if !validNowhereShareCarrier(up) || !validNowhereShareCarrier(down) {
+				log.Warnln("nowhere share-link: invalid carrier selector")
+				continue
+			}
+			mux := 0
+			if rawMux := query.Get("mux"); rawMux != "" {
+				parsed, err := strconv.Atoi(rawMux)
+				if err != nil || (parsed != 0 && parsed != 1) {
+					log.Warnln("nowhere share-link: invalid mux value")
+					continue
+				}
+				mux = parsed
+				if mux == 1 && up == "udp" && down == "udp" {
+					log.Warnln("nowhere share-link: mux=1 is canonicalized to 0 for udp/udp")
+					mux = 0
+				}
+			}
+			tcpTCP := up == "tcp" && down == "tcp" && mux == 0
+
+			nowhere := make(map[string]any, 16)
+			nowhere["name"] = uniqueName(names, urlNowhere.Fragment)
+			nowhere["type"] = "nowhere"
+			nowhere["server"] = urlNowhere.Hostname()
+			if port := urlNowhere.Port(); port != "" {
+				nowhere["port"] = port
+			} else {
+				nowhere["port"] = "443"
+			}
+			nowhere["password"] = key
+			nowhere["udp"] = true
+
+			nowhere["up"] = up
+			nowhere["down"] = down
+			if mux == 1 {
+				nowhere["mux"] = 1
+			}
+			if sni := query.Get("sni"); sni != "" && sni != "none" {
+				nowhere["sni"] = sni
+			}
+			if alpns, present := query["alpn"]; present {
+				if len(alpns) != 1 || alpns[0] != "nw2" {
+					log.Warnln("nowhere share-link: alpn must be nw2")
+					continue
+				}
+				nowhere["alpn"] = []string{"nw2"}
+			} else {
+				// The nowhere:// share link is the Nowhere 2 matrix. An omitted
+				// ALPN would otherwise select Nowhere 3, which rejects up/down.
+				nowhere["alpn"] = []string{"nw2"}
+			}
+			if pool := query.Get("pool"); pool != "" && tcpTCP {
+				parsed, err := strconv.Atoi(pool)
+				if err != nil {
+					log.Warnln("nowhere share-link: invalid pool value")
+				} else if parsed < 0 {
+					log.Warnln("nowhere share-link: pool must be >= 0")
+				} else {
+					if parsed > nowhereTransport.MaxPoolSize {
+						log.Warnln("nowhere share-link: pool %d exceeds maximum %d; using %d", parsed, nowhereTransport.MaxPoolSize, nowhereTransport.MaxPoolSize)
+						parsed = nowhereTransport.MaxPoolSize
+					}
+					nowhere["pool"] = parsed
+				}
+			} else if pool := query.Get("pool"); pool != "" && pool != "0" {
+				log.Warnln("nowhere share-link: pool is only effective for dedicated tcp/tcp; ignoring configured value")
+			}
+			if insecure, _ := strconv.ParseBool(query.Get("insecure")); insecure {
+				nowhere["skip-cert-verify"] = true
+			}
+			if fp := query.Get("fp"); fp != "" {
+				nowhere["fingerprint"] = fp
+			}
+			if pin := query.Get("pin"); pin != "" && pin != "none" {
+				nowhere["pin"] = pin
+			}
+			if rawMorph := query.Get("morph"); rawMorph != "" {
+				parsed, err := strconv.Atoi(rawMorph)
+				if err != nil || (parsed != 0 && parsed != 1) {
+					log.Warnln("nowhere share-link: morph must be 0 or 1")
+					continue
+				}
+				if parsed == 1 {
+					nowhere["morph"] = true
+				}
+			}
+			if ech := query.Get("ech"); ech != "" {
+				nowhere["ech-opts"] = map[string]any{
+					"enable": true,
+					"config": ech,
+				}
+			}
+
+			proxies = append(proxies, nowhere)
 		}
 	}
 
@@ -726,4 +853,8 @@ func uniqueName(names map[string]int, name string) string {
 		names[name] = index
 	}
 	return name
+}
+
+func validNowhereShareCarrier(s string) bool {
+	return s == "tcp" || s == "udp"
 }

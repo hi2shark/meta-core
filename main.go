@@ -72,7 +72,7 @@ func init() {
 	flag.StringVar(&postUp, "post-up", os.Getenv("CLASH_POST_UP"), "set post-up script")
 	flag.StringVar(&postDown, "post-down", os.Getenv("CLASH_POST_DOWN"), "set post-down script")
 	flag.BoolVar(&geodataMode, "m", false, "set geodata mode")
-	flag.BoolVar(&version, "v", false, "show current version of mihomo")
+	flag.BoolVar(&version, "v", false, "show current version of clash-meta-nw")
 	flag.BoolVar(&testConfig, "t", false, "test configuration and exit")
 	flag.Parse()
 }
@@ -114,7 +114,7 @@ func main() {
 	}
 
 	if version {
-		fmt.Printf("Mihomo Meta %s %s %s with %s %s\n",
+		fmt.Printf("clash-meta-nw %s %s %s with %s %s\n",
 			C.Version, runtime.GOOS, runtime.GOARCH, runtime.Version(), C.BuildTime)
 		if tags := features.Tags(); len(tags) != 0 {
 			fmt.Printf("Use tags: %s\n", strings.Join(tags, ", "))

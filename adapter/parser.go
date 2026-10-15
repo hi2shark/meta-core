@@ -6,6 +6,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/common/structure"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/transport/nowhere"
 )
 
 func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error) {
@@ -223,6 +224,27 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewEasyTier(*easyTierOption)
+	case "nowhere":
+		nowhereOption := &outbound.NowhereOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, nowhereOption)
+		if err != nil {
+			break
+		}
+		if _, ok := mapping["udp"]; !ok {
+			nowhereOption.UDP = true
+		}
+		// An omitted ALPN, or a single nw3, is Nowhere 3. Exactly nw2 is the
+		// Nowhere 2 compatibility stack. Any other name is rejected.
+		nw3, stackErr := nowhere.SelectNowhereStack(nowhereOption.ALPN)
+		if stackErr != nil {
+			err = fmt.Errorf("nowhere %s: %w", nowhereOption.Name, stackErr)
+			break
+		}
+		if nw3 {
+			proxy, err = outbound.NewNowhere(*nowhereOption)
+		} else {
+			proxy, err = outbound.NewNowhereV2(*nowhereOption)
+		}
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}

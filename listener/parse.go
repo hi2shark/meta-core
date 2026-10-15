@@ -6,6 +6,7 @@ import (
 	"github.com/metacubex/mihomo/common/structure"
 	C "github.com/metacubex/mihomo/constant"
 	IN "github.com/metacubex/mihomo/listener/inbound"
+	nwtransport "github.com/metacubex/mihomo/transport/nowhere"
 )
 
 func ParseListener(mapping map[string]any) (C.InboundListener, error) {
@@ -154,6 +155,33 @@ func ParseListener(mapping map[string]any) (C.InboundListener, error) {
 			return nil, err
 		}
 		listener, err = IN.NewAnyTLS(anytlsOption)
+	case "nowhere":
+		nowhereOption := &IN.NowhereOption{
+			CongestionController: "bbr",
+		}
+		err = decoder.Decode(mapping, nowhereOption)
+		if err != nil {
+			return nil, err
+		}
+		// An omitted ALPN, or a single nw3, is Nowhere 3. Exactly nw2 is the
+		// Nowhere 2 compatibility stack. Any other name is rejected. An omitted
+		// value is not rewritten to nw2.
+		nw3, stackErr := nwtransport.SelectNowhereStack(nowhereOption.ALPN)
+		if stackErr != nil {
+			return nil, fmt.Errorf("nowhere %s: %w", nowhereOption.Name(), stackErr)
+		}
+		if nw3 {
+			listener, err = IN.NewNowhere(nowhereOption)
+		} else {
+			listener, err = IN.NewNowhereV2(nowhereOption)
+		}
+	case "nowhere-egress":
+		nowhereEgressOption := &IN.NowhereEgressOption{}
+		err = decoder.Decode(mapping, nowhereEgressOption)
+		if err != nil {
+			return nil, err
+		}
+		listener, err = IN.NewNowhereEgress(nowhereEgressOption)
 	case "mieru":
 		mieruOption := &IN.MieruOption{}
 		err = decoder.Decode(mapping, mieruOption)

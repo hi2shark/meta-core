@@ -329,3 +329,199 @@ func TestConvertsV2RayVmessBase64HTTPRemappedToH2Transport(t *testing.T) {
 	_, err = adapter.ParseProxy(proxies[0])
 	assert.NoError(t, err)
 }
+
+// TestConvertsV2RayNowhere covers the nowhere:// share-link import, mirroring
+// Anywhere's ProxyConfiguration+URLParsing.parseNowhere.
+func TestConvertsV2RayNowhere(t *testing.T) {
+	// key=secret, up=down=tcp, pool=3, with SNI/ALPN/insecure/ECH.
+	link := "nowhere://secret@example.com:2077?up=tcp&down=tcp&sni=real.example.com&alpn=nw2&pool=3&insecure=1&ech=ABCD1234#nw"
+
+	expected := []map[string]any{
+		{
+			"name":             "nw",
+			"type":             "nowhere",
+			"server":           "example.com",
+			"port":             "2077",
+			"password":         "secret",
+			"udp":              true,
+			"up":               "tcp",
+			"down":             "tcp",
+			"sni":              "real.example.com",
+			"alpn":             []string{"nw2"},
+			"pool":             3,
+			"skip-cert-verify": true,
+			"ech-opts": map[string]any{
+				"enable": true,
+				"config": "ABCD1234",
+			},
+		},
+	}
+
+	proxies, err := ConvertsV2Ray([]byte(link))
+	assert.Nil(t, err)
+	assert.Equal(t, expected, proxies)
+
+	// The converted map must parse into a real Nowhere outbound.
+	_, err = adapter.ParseProxy(proxies[0])
+	assert.NoError(t, err)
+}
+
+// TestConvertsV2RayNowhereIgnoresLegacyNet pins that the removed net= alias is
+// no longer honored: carriers fall back to the udp/udp default and no network
+// key is emitted.
+func TestConvertsV2RayNowhereIgnoresLegacyNet(t *testing.T) {
+	proxies, err := ConvertsV2Ray([]byte("nowhere://secret@example.com:2077?net=tcp#legacy"))
+	assert.Nil(t, err)
+	assert.Len(t, proxies, 1)
+	assert.Equal(t, "udp", proxies[0]["up"])
+	assert.Equal(t, "udp", proxies[0]["down"])
+	assert.NotContains(t, proxies[0], "network")
+}
+
+func TestConvertsV2RayNowhereRejectsLegacyALPN(t *testing.T) {
+	proxies, err := ConvertsV2Ray([]byte("nowhere://secret@example.com:2077?alpn=now/1#legacy-alpn"))
+	assert.Error(t, err)
+	assert.Empty(t, proxies)
+}
+
+func TestConvertsV2RayNowhereRejectsMultipleALPN(t *testing.T) {
+	proxies, err := ConvertsV2Ray([]byte("nowhere://secret@example.com:2077?alpn=nw2,h3#invalid-alpn"))
+	assert.Error(t, err)
+	assert.Empty(t, proxies)
+}
+
+// TestConvertsV2RayNowhereAsymmetric covers the up=/down= asymmetric matrix.
+func TestConvertsV2RayNowhereAsymmetric(t *testing.T) {
+	// up=tcp, down=udp: TCP relay/UoT uplink over TLS/TCP, download over QUIC.
+	link := "nowhere://secret@example.com:2077?up=tcp&down=udp#asym"
+	proxies, err := ConvertsV2Ray([]byte(link))
+	assert.Nil(t, err)
+	assert.Len(t, proxies, 1)
+	assert.Equal(t, "tcp", proxies[0]["up"])
+	assert.Equal(t, "udp", proxies[0]["down"])
+	assert.NotContains(t, proxies[0], "spec")
+	// pool must not be emitted for a matrix containing UDP.
+	_, hasPool := proxies[0]["pool"]
+	assert.False(t, hasPool)
+
+	_, err = adapter.ParseProxy(proxies[0])
+	assert.NoError(t, err)
+}
+
+// TestConvertsV2RayNowhereMinimal covers the bare-minimum link and a default
+// port when omitted.
+func TestConvertsV2RayNowhereMinimal(t *testing.T) {
+	link := "nowhere://k@host#bare"
+	proxies, err := ConvertsV2Ray([]byte(link))
+	assert.Nil(t, err)
+	assert.Len(t, proxies, 1)
+	assert.Equal(t, "bare", proxies[0]["name"])
+	assert.Equal(t, "443", proxies[0]["port"])
+	assert.Equal(t, "k", proxies[0]["password"])
+	assert.NotContains(t, proxies[0], "key")
+
+	_, err = adapter.ParseProxy(proxies[0])
+	assert.NoError(t, err)
+}
+
+func TestConvertsV2RayNowhereDecodesCredentialOnce(t *testing.T) {
+	proxies, err := ConvertsV2Ray([]byte("nowhere://p%253A%40%E9%9B%AA@example.com:2077#encoded"))
+	if err != nil || len(proxies) != 1 {
+		t.Fatalf("ConvertsV2Ray failed to import encoded Nowhere credential")
+	}
+	credential, ok := proxies[0]["password"].(string)
+	if !ok || credential != "p%3A@雪" {
+		t.Fatalf("ConvertsV2Ray did not decode the Nowhere credential exactly once")
+	}
+	if _, exists := proxies[0]["key"]; exists {
+		t.Fatalf("ConvertsV2Ray emitted the deprecated key alias")
+	}
+}
+
+// TestConvertsV2RayNowhereRejectsPassword confirms a password component is
+// dropped, matching the Nowhere credential model.
+func TestConvertsV2RayNowhereRejectsPassword(t *testing.T) {
+	link := "nowhere://key:pass@example.com:2077#bad"
+	proxies, err := ConvertsV2Ray([]byte(link))
+	// No nowhere proxy should be emitted; the converter returns an error since
+	// the line yields zero proxies.
+	if err == nil {
+		assert.Empty(t, proxies)
+	}
+}
+
+// TestConvertsV2RayNowhereRejectsOneSidedUpDown pins YAML/URI parity: only one
+// of up/down is rejected rather than silently defaulting the other side.
+func TestConvertsV2RayNowhereRejectsOneSidedUpDown(t *testing.T) {
+	for _, link := range []string{
+		"nowhere://secret@example.com:2077?up=tcp#one",
+		"nowhere://secret@example.com:2077?down=udp#one",
+	} {
+		proxies, err := ConvertsV2Ray([]byte(link))
+		if err == nil {
+			assert.Empty(t, proxies, link)
+		}
+	}
+}
+
+// TestConvertsV2RayNowherePoolClamp covers tcp/tcp pool clamp and UDP ignore.
+func TestConvertsV2RayNowherePoolClamp(t *testing.T) {
+	proxies, err := ConvertsV2Ray([]byte("nowhere://secret@example.com:2077?up=tcp&down=tcp&pool=999#clamp"))
+	assert.NoError(t, err)
+	assert.Len(t, proxies, 1)
+	assert.Equal(t, 256, proxies[0]["pool"])
+	_, err = adapter.ParseProxy(proxies[0])
+	assert.NoError(t, err)
+
+	proxies, err = ConvertsV2Ray([]byte("nowhere://secret@example.com:2077?up=udp&down=udp&pool=5#ignore"))
+	assert.NoError(t, err)
+	assert.Len(t, proxies, 1)
+	_, hasPool := proxies[0]["pool"]
+	assert.False(t, hasPool)
+	_, err = adapter.ParseProxy(proxies[0])
+	assert.NoError(t, err)
+}
+
+// TestConvertsV2RayNowhereNegativePool rejects negative pool without emitting.
+func TestConvertsV2RayNowhereNegativePool(t *testing.T) {
+	proxies, err := ConvertsV2Ray([]byte("nowhere://secret@example.com:2077?up=tcp&down=tcp&pool=-1#neg"))
+	assert.NoError(t, err)
+	assert.Len(t, proxies, 1)
+	_, hasPool := proxies[0]["pool"]
+	assert.False(t, hasPool)
+}
+
+func TestConvertsV2RayNowhereRejectsMixCarrier(t *testing.T) {
+	// mix is not a carrier since Nowhere 2.2: the share link is skipped, so a
+	// subscription holding nothing else reports a format error.
+	_, err := ConvertsV2Ray([]byte("nowhere://secret@example.com:2077?up=mix&down=mix&mux=1#mix"))
+	assert.Error(t, err)
+
+	_, err = adapter.ParseProxy(map[string]any{
+		"type": "nowhere", "name": "mix", "server": "example.com",
+		"port": 2077, "password": "secret", "alpn": []string{"nw2"},
+		"up": "mix", "down": "mix", "mux": 1,
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "must be tcp or udp")
+}
+
+func TestConvertsV2RayNowhereMorph(t *testing.T) {
+	proxies, err := ConvertsV2Ray([]byte("nowhere://secret@example.com:2077?morph=1#morph"))
+	assert.NoError(t, err)
+	assert.Len(t, proxies, 1)
+	assert.Equal(t, true, proxies[0]["morph"])
+	_, err = adapter.ParseProxy(proxies[0])
+	assert.NoError(t, err)
+
+	proxies, err = ConvertsV2Ray([]byte("nowhere://secret@example.com:2077?morph=0#plain"))
+	assert.NoError(t, err)
+	assert.Len(t, proxies, 1)
+	_, hasMorph := proxies[0]["morph"]
+	assert.False(t, hasMorph)
+
+	proxies, err = ConvertsV2Ray([]byte("nowhere://secret@example.com:2077?morph=2#bad"))
+	if err == nil {
+		assert.Empty(t, proxies)
+	}
+}

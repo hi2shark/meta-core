@@ -1743,6 +1743,59 @@ proxies: # socks5
     # min-streams: 5 # Minimum multiplexed streams in a connection before opening a new connection. Conflict with max-streams.
     # max-streams: 0 # Maximum multiplexed streams in a connection before opening a new connection. Conflict with max-connections and min-streams.
 
+  # nowhere（Nowhere 3，默认；省略 alpn 即 nw3）
+  # 每个端点只使用一种传输（net），固定 TLS 1.3 + ALPN nw3，无多路复用：
+  # 每条业务流独占一个 session，因此 up/down、mux、pool、预热与 uTLS/ECH 字段全部不允许填写。
+  - name: nowhere
+    type: nowhere
+    server: server
+    port: 443
+    password: PASSWORD # 必填，恰好 32 位小写十六进制（可用 openssl rand -hex 16 生成）
+    udp: true # 默认为 true
+    # alpn: # 省略或 nw3 都是 Nowhere 3
+    #   - nw3
+    net: tcp # tcp（TLS over TCP，默认）或 udp（QUIC）
+    # sni: "example.com"
+    # skip-cert-verify: true
+    # pin: <leaf cert sha256 hex> # 叶子证书 SHA-256 十六进制 pin 校验，优先于证书链校验
+    # congestion-controller: bbr
+    # cwnd: 32
+    # morph: true # Nowhere 3 默认为开启；对端必须同样开启
+
+  # nowhere（Nowhere 2 兼容；必须显式 alpn: [nw2]）
+  # up/down、mux、pool、预热、uTLS 与 ECH 只在这条路径有效。
+  - name: nowhere-nw2
+    type: nowhere
+    server: server
+    port: 443
+    password: PASSWORD # 必填，Portal 要求 32-64 位小写十六进制
+    udp: true # 默认为 true
+    alpn:
+      - nw2
+    # up: udp # 上行载体，tcp 或 udp；必须与 down 同时设置，默认 udp/udp
+    # down: udp # 下行载体，tcp 或 udp；必须与 up 同时设置，默认 udp/udp
+    # mux: 0 # 0 专用 TLS 通道（默认），1 启用 TLS Mux；任一方向为 tcp 时生效，udp/udp 会规范为 0
+    # pool: 5 # 连接池大小，仅 mux=0 且 tcp/tcp 时默认 5，否则忽略；超过 256 时钳制为 256
+    # prewarm-on-start: false # 启动时预热 tcp/tcp 连接池，默认首条业务连接时再补充
+    # max-concurrent-dials: 16 # 单出站并发物理拨号上限，0 使用内核默认值
+    # dial4: auto # 连接 Portal 时使用的 IPv4 源地址，或 auto；与 dial6 一起构成双栈源地址策略
+    # dial6: auto # 连接 Portal 时使用的 IPv6 源地址，或 auto
+    # warm-backoff-initial: 1 # 预热重试初始退避（秒）
+    # warm-backoff-max: 30 # 预热重试退避上限（秒）
+    # sni: "example.com"
+    # skip-cert-verify: true
+    # fingerprint: <leaf cert sha256 hex> # 证书固定，等价于 pin；两者同时填写且不一致时 pin 优先
+    # pin: <leaf cert sha256 hex> # 叶子证书 SHA-256 十六进制 pin 校验，优先于 fingerprint 与证书链校验
+    # certificate: ./client.crt # mTLS 客户端证书 PEM 格式或路径
+    # private-key: ./client.key # mTLS 客户端私钥 PEM 格式或路径
+    # client-fingerprint: chrome # 仅 TLS/TCP 载体生效，QUIC 使用标准 TLS ClientHello
+    # ech-opts: # ECH 配置
+    #   enable: true
+    #   config: <ech config base64>
+    # congestion-controller: bbr
+    # cwnd: 32
+    # morph: true # 官方 CLI morph=1，在 TLS/QUIC 之下做 keyed transform；对端必须同样开启。Nowhere 2 省略时为关闭
+
 # dns 出站会将请求劫持到内部 dns 模块，所有请求均在内部处理
   - name: "dns-out"
     type: dns
@@ -2365,6 +2418,83 @@ listeners:
     #  alpn:
     #    - h3
     #  max-udp-relay-packet-size: 1500
+
+  # Nowhere 3 入站（默认；省略 alpn 即 nw3）：只提供一种传输，固定 TLS 1.3 + ALPN nw3。
+  # 不支持 next 链式转发与 ECH（这些字段需要 alpn: [nw2]）。
+  # 省略 certificate/private-key 时每次启动生成内存自签证书（客户端使用 skip-cert-verify 或 pin 校验）。
+  # net 为 udp 时可再加 egress: true 把该 Portal 变成出口桥：它只接受一个 nowhere-egress
+  # 注册，并把全部已认证流量转发给那个出口，而不再交给本机路由。
+  - name: nowhere-in-1
+    type: nowhere
+    port: 10825 # 支持使用ports格式，例如200,302 or 200,204,401-429,501-503
+    listen: 0.0.0.0
+    # routing-mark: 0 # 为监听socket设置routing-mark（仅支持linux）
+    # rule: sub-rule-name1 # 默认使用 rules，如果未找到 sub-rule 则直接使用 rules
+    # proxy: proxy # 如果不为空则直接将该入站流量交由指定 proxy 处理 (当 proxy 不为空时，这里的 proxy 名称必须合法，否则会出错)
+    password: PASSWORD # 必填，恰好 32 位小写十六进制（可用 openssl rand -hex 16 生成）
+    # alpn: # 省略或 nw3 都是 Nowhere 3
+    #   - nw3
+    net: tcp # tcp（TLS over TCP，默认）或 udp（QUIC）
+    # egress: false # 仅 net: udp 时可用；开启后需配合下面的 nowhere-egress 入站
+    # 以下两项可选：省略时每次启动生成内存自签证书（客户端使用 skip-cert-verify 或 pin 校验）
+    # certificate: ./server.crt # 证书 PEM 格式，或者 证书的路径
+    # private-key: ./server.key # 证书对应的私钥 PEM 格式，或者私钥路径
+    # congestion-controller: bbr
+    # cwnd: 32
+    # morph: true # Nowhere 3 默认为开启；对端必须同样开启
+
+  # Nowhere 2 入站兼容：必须显式 alpn: [nw2]。next 链式转发与 ECH 只在这条路径有效。
+  # 填写 next 后将全部入站流量转发至下一个 Nowhere Portal，并跳过 mihomo 的路由/规则
+  # （rule、proxy、rules 对该监听器均不生效）；转发连接的 alpn 与 congestion-controller/cwnd
+  # 继承自监听配置；链上每个 Portal 必须是 Nowhere 2。
+  - name: nowhere-in-nw2
+    type: nowhere
+    port: 10825
+    listen: 0.0.0.0
+    password: PASSWORD # 必填，与客户端共享的密钥；Portal 要求 32-64 位小写十六进制（URL 百分号解码后）
+    alpn:
+      - nw2
+    # 以下两项可选：省略时每次启动生成内存自签证书（客户端使用 skip-cert-verify 或 pin 校验）
+    # certificate: ./server.crt # 证书 PEM 格式，或者 证书的路径
+    # private-key: ./server.key # 证书对应的私钥 PEM 格式，或者私钥路径
+    #  如果填写则开启ech（可由 mihomo generate ech-keypair <明文域名> 生成）
+    #  ech-key: |
+    #    -----BEGIN ECH KEYS-----
+    #    ACATwY30o/RKgD6hgeQxwrSiApLaCgU+HKh7B6SUrAHaDwBD/g0APwAAIAAgHjzK
+    #    madSJjYQIf9o1N5GXjkW4DEEeb17qMxHdwMdNnwADAABAAEAAQACAAEAAwAIdGVz
+    #    dC5jb20AAA==
+    #    -----END ECH KEYS-----
+    #  congestion-controller: bbr
+    #  cwnd: 32
+    #  morph: true # 官方 CLI morph=1，在 TLS/QUIC 之下做 keyed transform；对端必须同样开启。Nowhere 2 省略时为关闭
+    #  next:
+    #    server: origin.example # 必填，下一跳 Portal 地址
+    #    port: 2080 # 必填，下一跳 Portal 端口（1-65535）
+    #    password: origin-key # 必填，下一跳 Portal 的共享密钥
+    #    up: tcp # 上行载体，tcp 或 udp；必须与 down 同时设置，默认 udp/udp
+    #    down: tcp # 下行载体，tcp 或 udp；必须与 up 同时设置，默认 udp/udp
+    #    mux: 0 # 0 专用 TLS 通道（默认），1 启用 TLS Mux；任一方向为 tcp 时生效，udp/udp 会规范为 0
+    #    pool: 5 # 连接池大小，仅 mux=0 且 tcp/tcp 时默认 5，否则忽略；超过 256 时钳制为 256
+    #    dial4: auto # 连接下一跳 Portal 时使用的 IPv4 源地址，或 auto；与 dial6 一起构成双栈源地址策略
+    #    dial6: auto # 连接下一跳 Portal 时使用的 IPv6 源地址，或 auto
+    #    sni: origin.example # 连接下一跳 Portal 时的 TLS SNI；省略/置空/none 时关闭证书链与域名校验（域名形式的 server 仍作为 ClientHello SNI 发送），显式域名则启用系统根证书链与域名校验
+    #    pin: <leaf cert sha256 hex> # 下一跳 Portal 叶子证书的 SHA-256 十六进制 pin 校验，优先于 sni/证书链校验；none 等价于省略
+    #    morph: true # 省略时继承监听器 morph；密钥由 next.password 派生
+
+  # nowhere-egress（Nowhere 3 出口客户端）：自身不监听任何端口，它通过 QUIC 连接一个
+  # egress: true 的 Portal 并注册为唯一出口，Portal 转发的流量全部由本机路由处理。
+  # 连接断开后按 3 秒冷却自动重连；Portal 已有出口时本次注册会被拒并持续重试，不会抢占。
+  - name: nowhere-egress-1
+    type: nowhere-egress
+    server: portal.example # 必填，出口桥 Portal 地址
+    server-port: 443 # 必填，Portal 端口（1-65535）；入站自身的 listen/port 对该类型无意义
+    password: PASSWORD # 必填，Nowhere 3 要求恰好 32 位小写十六进制
+    # sni: portal.example # 连接 Portal 时的 TLS SNI；省略时使用 server，IP 字面量则关闭域名校验
+    # pin: <leaf cert sha256 hex> # Portal 叶子证书 SHA-256 十六进制 pin 校验，优先于证书链校验
+    # skip-cert-verify: true
+    # congestion-controller: bbr
+    # cwnd: 32
+    # morph: true # Nowhere 3 默认为开启；Portal 必须同样开启
 
   - name: shadowquic-in-1
     type: shadowquic

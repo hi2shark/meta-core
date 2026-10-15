@@ -722,6 +722,22 @@ func closeTunListener() {
 	}
 }
 
+// closeInboundListeners tears down every listener registered through
+// PatchInboundListeners. Listeners that only stop serving when their process
+// exits — the nowhere-egress exit holds a live QUIC session to its Portal —
+// need this to release the remote end on shutdown instead of leaving it to
+// notice a dead socket.
+func closeInboundListeners() {
+	inboundMux.Lock()
+	listeners := inboundListeners
+	inboundListeners = map[string]C.InboundListener{}
+	inboundMux.Unlock()
+	for _, l := range listeners {
+		_ = l.Close()
+	}
+}
+
 func Cleanup() {
 	closeTunListener()
+	closeInboundListeners()
 }

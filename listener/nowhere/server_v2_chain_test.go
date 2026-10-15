@@ -1,0 +1,409 @@
+package nowhere_test
+
+import (
+	"encoding/pem"
+	"net"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/metacubex/mihomo/adapter/outbound"
+	C "github.com/metacubex/mihomo/constant"
+	LC "github.com/metacubex/mihomo/listener/config"
+	IN "github.com/metacubex/mihomo/listener/inbound"
+	nwtransport "github.com/metacubex/mihomo/transport/nowhere"
+)
+
+// testNextPin is the leaf-certificate SHA-256 pin of testCertificate: the
+// chained Portal verifies the next hop by pin (the next schema exposes no
+// skip-cert-verify).
+var testNextPin = func() string {
+	block, _ := pem.Decode([]byte(testCertificate))
+	if block == nil {
+		return ""
+	}
+	return nwtransport.LeafCertificateSHA256Hex(block.Bytes)
+}()
+
+// countingTunnel stands in for the relay's local routing: with a next section
+// every flow must forward to the origin Portal, so any direct use means
+// chaining silently fell back to the tunnel.
+type countingTunnel struct {
+	C.Tunnel
+	tcp atomic.Int32
+	udp atomic.Int32
+}
+
+func (t *countingTunnel) HandleTCPConn(conn net.Conn, _ *C.Metadata) {
+	t.tcp.Add(1)
+	_ = conn.Close()
+}
+
+func (t *countingTunnel) HandleUDPPacket(packet C.UDPPacket, _ *C.Metadata) {
+	t.udp.Add(1)
+	packet.Drop()
+}
+
+func (t *countingTunnel) calls() int32 { return t.tcp.Load() + t.udp.Load() }
+
+// startRelayServer builds a relay Portal through the public inbound schema
+// (NowhereOption -> NewNowhereV2 -> Listen) with a next section pointing at the
+// origin Portal: every inbound flow forwards to the origin (native Portal
+// chaining). up/down/pin configure the next hop towards the
+// origin; an empty up/down pair exercises the udp/udp default.
+func startRelayServer(t *testing.T, originPort int, up, down, pin string) (int, *countingTunnel) {
+	return startRelayServerOpt(t, originPort, up, down, pin, nil, nil)
+}
+
+func startRelayServerOpt(t *testing.T, originPort int, up, down, pin string, morph *bool, nextMorph *bool) (int, *countingTunnel) {
+	t.Helper()
+	tunnel := &countingTunnel{}
+	relay, err := IN.NewNowhereV2(&IN.NowhereOption{
+		BaseOption:           IN.BaseOption{NameStr: "nowhere-test-relay", Listen: "127.0.0.1", Port: "0"},
+		Password:             testPassword,
+		Certificate:          testCertificate,
+		PrivateKey:           testPrivateKey,
+		ALPN:                 []string{"nw2"},
+		CongestionController: "bbr",
+		Morph:                morph,
+		Next: &IN.NowhereNextOption{
+			Server:   "127.0.0.1",
+			Port:     originPort,
+			Password: testPassword,
+			Up:       up,
+			Down:     down,
+			Pin:      pin,
+			Morph:    nextMorph,
+		},
+	})
+	if err != nil {
+		t.Fatalf("inbound.NewNowhereV2 with next: %v", err)
+	}
+	if err := relay.Listen(tunnel); err != nil {
+		t.Fatalf("relay Listen: %v", err)
+	}
+	t.Cleanup(func() { _ = relay.Close() })
+
+	address := relay.Address()
+	_, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q): %v", address, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("port %q: %v", portStr, err)
+	}
+	return port, tunnel
+}
+
+// assertTunnelUnused fails when the relay handed any flow to its local tunnel
+// instead of chaining it to the origin Portal.
+func assertTunnelUnused(t *testing.T, tunnel *countingTunnel) {
+	t.Helper()
+	if calls := tunnel.calls(); calls != 0 {
+		t.Fatalf("relay tunnel handled %d flows, want 0 (all flows must chain to the origin)", calls)
+	}
+}
+
+// TestNowhereNextValidation exercises the option-layer next validation
+// (validateNowhereNext) through the public schema: the port must fit the Rust
+// u16, an explicit sni must be an ASCII DNS name, and the "none" sentinel is
+// accepted as an alias for an omitted sni/pin.
+func TestNowhereNextValidation(t *testing.T) {
+	newNowhere := func(next *IN.NowhereNextOption) error {
+		_, err := IN.NewNowhereV2(&IN.NowhereOption{
+			BaseOption: IN.BaseOption{NameStr: "nowhere-test-validation", Listen: "127.0.0.1", Port: "0"},
+			Password:   testPassword,
+			ALPN:       []string{"nw2"},
+			Next:       next,
+		})
+		return err
+	}
+	valid := func() *IN.NowhereNextOption {
+		return &IN.NowhereNextOption{Server: "origin.example", Port: 2080, Password: testPassword}
+	}
+
+	cases := []struct {
+		name    string
+		mutate  func(*IN.NowhereNextOption)
+		wantErr string
+	}{
+		{"port above u16", func(n *IN.NowhereNextOption) { n.Port = 65536 }, "invalid port"},
+		{"sni none accepted", func(n *IN.NowhereNextOption) { n.SNI = "none" }, ""},
+		{"pin none accepted", func(n *IN.NowhereNextOption) { n.Pin = "none" }, ""},
+		{"sni dns name", func(n *IN.NowhereNextOption) { n.SNI = "origin.example" }, ""},
+		{"sni IP literal", func(n *IN.NowhereNextOption) { n.SNI = "203.0.113.1" }, "must be an ASCII DNS name"},
+		{"sni with colon", func(n *IN.NowhereNextOption) { n.SNI = "origin.example:2080" }, "must be an ASCII DNS name"},
+		{"sni oversized", func(n *IN.NowhereNextOption) { n.SNI = strings.Repeat("a", 254) }, "must be an ASCII DNS name"},
+		{"sni non-ascii", func(n *IN.NowhereNextOption) { n.SNI = "例子.example" }, "must be an ASCII DNS name"},
+		{"tcp pool negative", func(n *IN.NowhereNextOption) { n.Up, n.Down, n.Pool = "tcp", "tcp", intPointer(-1) }, "must be >= 0"},
+		{"tcp pool above max clamped", func(n *IN.NowhereNextOption) {
+			n.Up, n.Down, n.Pool = "tcp", "tcp", intPointer(nwtransport.MaxPoolSize+1)
+		}, ""},
+		{"udp pool negative ignored", func(n *IN.NowhereNextOption) { n.Up, n.Down, n.Pool = "udp", "udp", intPointer(-1) }, ""},
+		{"mix rejected", func(n *IN.NowhereNextOption) { n.Up, n.Down = "mix", "mix" }, "must be tcp or udp"},
+		{"tcp/mix rejected", func(n *IN.NowhereNextOption) { n.Up, n.Down = "tcp", "mix" }, "must be tcp or udp"},
+		{"mux=1 tcp/tcp", func(n *IN.NowhereNextOption) { n.Up, n.Down, n.Mux = "tcp", "tcp", intPointer(1) }, ""},
+		{"invalid mux", func(n *IN.NowhereNextOption) { n.Mux = intPointer(2) }, "invalid mux"},
+		{"dial4 auto accepted", func(n *IN.NowhereNextOption) { n.Dial4 = "auto" }, ""},
+		{"dial6 auto accepted", func(n *IN.NowhereNextOption) { n.Dial6 = "auto" }, ""},
+		{"dial4 v4 literal accepted", func(n *IN.NowhereNextOption) { n.Dial4 = "10.0.0.1" }, ""},
+		{"dial6 v6 literal accepted", func(n *IN.NowhereNextOption) { n.Dial6 = "2001:db8::5" }, ""},
+		{"dial4 v6 literal rejected", func(n *IN.NowhereNextOption) { n.Dial4 = "::1" }, "dial4 must be auto or an IPv4 literal"},
+		{"dial6 v4 literal rejected", func(n *IN.NowhereNextOption) { n.Dial6 = "1.2.3.4" }, "dial6 must be auto or an IPv6 literal"},
+		{"dial6 v4-mapped rejected", func(n *IN.NowhereNextOption) { n.Dial6 = "::ffff:1.2.3.4" }, "dial6 must not be an IPv4-mapped IPv6 address"},
+		{"dial4 hostname rejected", func(n *IN.NowhereNextOption) { n.Dial4 = "localhost" }, "dial4 must be auto or an IPv4 literal"},
+		{"morph inherit", func(n *IN.NowhereNextOption) {}, ""},
+		{"morph override off", func(n *IN.NowhereNextOption) { n.Morph = boolPointer(false) }, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			next := valid()
+			tc.mutate(next)
+			err := newNowhere(next)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("NewNowhereV2: %v, want success", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("NewNowhereV2 error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func intPointer(value int) *int { return &value }
+
+func boolPointer(value bool) *bool { return &value }
+
+// TestNowhereInboundChain verifies native Portal chaining: the
+// client opens flows to the relay Portal, which forwards them through the
+// origin Portal (the relay initializes the HOPS budget) before the origin's
+// tunnel upstream echoes them back. Both the client and next-hop side run all
+// four carrier matrices, and the relay's own tunnel must never see a flow.
+func TestNowhereInboundChain(t *testing.T) {
+	originPort := startTestServer(t)
+	matrices := [][2]string{{"tcp", "tcp"}, {"udp", "udp"}, {"tcp", "udp"}, {"udp", "tcp"}}
+	for _, nextCarriers := range matrices {
+		nextUp, nextDown := nextCarriers[0], nextCarriers[1]
+		t.Run("next-"+nextUp+"/"+nextDown, func(t *testing.T) {
+			relayPort, tunnel := startRelayServer(t, originPort, nextUp, nextDown, testNextPin)
+			for _, carriers := range matrices {
+				up, down := carriers[0], carriers[1]
+				t.Run(up+"/"+down, func(t *testing.T) {
+					client := newTestClient(t, relayPort, up, down)
+					t.Run("tcp echo", func(t *testing.T) { testTCPEcho(t, client) })
+					t.Run("udp echo", func(t *testing.T) { testUDPEcho(t, client) })
+				})
+			}
+			assertTunnelUnused(t, tunnel)
+		})
+	}
+}
+
+// TestNowhereInboundMultiHop verifies that HOPS are initialized and consumed
+// across more than one native Portal boundary instead of being flattened into
+// a single host-side dial.
+func TestNowhereInboundMultiHop(t *testing.T) {
+	originPort := startTestServer(t)
+	relay2Port, relay2Tunnel := startRelayServer(t, originPort, "tcp", "tcp", testNextPin)
+	relay1Port, relay1Tunnel := startRelayServer(t, relay2Port, "tcp", "tcp", testNextPin)
+	client := newTestClient(t, relay1Port, "tcp", "tcp")
+	t.Run("tcp echo", func(t *testing.T) { testTCPEcho(t, client) })
+	t.Run("udp echo", func(t *testing.T) { testUDPEcho(t, client) })
+	assertTunnelUnused(t, relay1Tunnel)
+	assertTunnelUnused(t, relay2Tunnel)
+}
+
+// TestNowhereInboundChainDefaultTLS covers the default next-hop TLS policy:
+// no sni, no pin, and a self-signed origin (the in-memory certificate
+// fallback). The Rust contract disables certificate verification when sni is
+// omitted, so the default next section must still chain successfully.
+func TestNowhereInboundChainDefaultTLS(t *testing.T) {
+	originPort := startTestServerWith(t, "", "")
+	relayPort, tunnel := startRelayServer(t, originPort, "", "", "")
+	client := newTestClient(t, relayPort, "udp", "udp")
+	t.Run("tcp echo", func(t *testing.T) { testTCPEcho(t, client) })
+	t.Run("udp echo", func(t *testing.T) { testUDPEcho(t, client) })
+	assertTunnelUnused(t, tunnel)
+}
+
+func TestNowhereInboundMux(t *testing.T) {
+	originPort := startTestServer(t)
+	muxOne := 1
+
+	t.Run("client mux tcp/tcp", func(t *testing.T) {
+		client, err := outbound.NewNowhereV2(outbound.NowhereOption{
+			Name: "nowhere-test-mux", Server: "127.0.0.1", Port: originPort,
+			Password: testPassword, SkipCertVerify: true, ALPN: []string{"nw2"},
+			Up: "tcp", Down: "tcp", Mux: &muxOne, UDP: true,
+		})
+		if err != nil {
+			t.Fatalf("NewNowhereV2 mux: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+		testTCPEcho(t, client)
+		testUDPEcho(t, client)
+	})
+
+	// mix is a client carrier policy that Nowhere 2.2 dropped: the client
+	// bundle no longer resolves it, so the outbound must reject it.
+	t.Run("client mix/mix rejected", func(t *testing.T) {
+		_, err := outbound.NewNowhereV2(outbound.NowhereOption{
+			Name: "nowhere-test-mix", Server: "127.0.0.1", Port: originPort,
+			Password: testPassword, SkipCertVerify: true, ALPN: []string{"nw2"},
+			Up: "mix", Down: "mix", UDP: true,
+		})
+		if err == nil {
+			t.Fatal("NewNowhereV2 mix/mix: want error")
+		}
+		if !strings.Contains(err.Error(), "must be tcp or udp") {
+			t.Fatalf("NewNowhereV2 mix/mix error = %v, want \"must be tcp or udp\"", err)
+		}
+	})
+
+	t.Run("next mux tcp/tcp", func(t *testing.T) {
+		tunnel := &countingTunnel{}
+		relay, err := IN.NewNowhereV2(&IN.NowhereOption{
+			BaseOption:           IN.BaseOption{NameStr: "nowhere-test-relay-mux", Listen: "127.0.0.1", Port: "0"},
+			Password:             testPassword,
+			Certificate:          testCertificate,
+			PrivateKey:           testPrivateKey,
+			ALPN:                 []string{"nw2"},
+			CongestionController: "bbr",
+			Next: &IN.NowhereNextOption{
+				Server: "127.0.0.1", Port: originPort, Password: testPassword,
+				Up: "tcp", Down: "tcp", Mux: &muxOne, Pin: testNextPin,
+			},
+		})
+		if err != nil {
+			t.Fatalf("inbound.NewNowhereV2 mux next: %v", err)
+		}
+		if err := relay.Listen(tunnel); err != nil {
+			t.Fatalf("relay Listen: %v", err)
+		}
+		t.Cleanup(func() { _ = relay.Close() })
+		_, portStr, err := net.SplitHostPort(relay.Address())
+		if err != nil {
+			t.Fatalf("SplitHostPort: %v", err)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			t.Fatalf("port: %v", err)
+		}
+		client := newTestClient(t, port, "tcp", "tcp")
+		testTCPEcho(t, client)
+		testUDPEcho(t, client)
+		assertTunnelUnused(t, tunnel)
+	})
+
+	t.Run("next mix/mix rejected", func(t *testing.T) {
+		_, err := IN.NewNowhereV2(&IN.NowhereOption{
+			BaseOption:  IN.BaseOption{NameStr: "nowhere-test-relay-mix", Listen: "127.0.0.1", Port: "0"},
+			Password:    testPassword,
+			Certificate: testCertificate,
+			PrivateKey:  testPrivateKey,
+			ALPN:        []string{"nw2"},
+			Next: &IN.NowhereNextOption{
+				Server: "127.0.0.1", Port: originPort, Password: testPassword,
+				Up: "mix", Down: "mix", Pin: testNextPin,
+			},
+		})
+		if err == nil {
+			t.Fatal("inbound.NewNowhereV2 next mix/mix: want error")
+		}
+		if !strings.Contains(err.Error(), "must be tcp or udp") {
+			t.Fatalf("inbound.NewNowhereV2 next mix/mix error = %v, want \"must be tcp or udp\"", err)
+		}
+	})
+
+	// The Portal admission rule (Rust Credentials::for_portal): the listener
+	// key and every enabled next-hop key must be 32–64 lowercase hexadecimal
+	// characters after URL percent decoding.
+	t.Run("portal key admission", func(t *testing.T) {
+		for _, key := range []string{"secret", "NOWHERETESTSECRETNOWHERETESTSEC", "0123456789abcdef0123456789abcde", "0123456789abcdef0123456789abcdefg", " 0123456789abcdef0123456789abcd"} {
+			_, err := IN.NewNowhereV2(&IN.NowhereOption{
+				BaseOption: IN.BaseOption{NameStr: "nowhere-test-key", Listen: "127.0.0.1", Port: "0"},
+				Password:   key,
+				ALPN:       []string{"nw2"},
+			})
+			if err == nil {
+				t.Fatalf("NewNowhereV2 password %q: want error", key)
+			}
+			if !strings.Contains(err.Error(), "lowercase hexadecimal") {
+				t.Fatalf("NewNowhereV2 password %q error = %v, want the shared-key rule", key, err)
+			}
+		}
+		// Odd lengths inside the range are accepted (Nowhere 2.2.1).
+		for _, key := range []string{
+			"0123456789abcdef0123456789abcdef",
+			"0123456789abcdef0123456789abcdef0",
+			"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		} {
+			if _, err := IN.NewNowhereV2(&IN.NowhereOption{
+				BaseOption: IN.BaseOption{NameStr: "nowhere-test-key", Listen: "127.0.0.1", Port: "0"},
+				Password:   key,
+				ALPN:       []string{"nw2"},
+			}); err != nil {
+				t.Fatalf("NewNowhereV2 password %q: %v", key, err)
+			}
+		}
+		// A percent-encoded key decodes to the key text.
+		if _, err := IN.NewNowhereV2(&IN.NowhereOption{
+			BaseOption: IN.BaseOption{NameStr: "nowhere-test-key", Listen: "127.0.0.1", Port: "0"},
+			Password:   "%30" + "123456789abcdef0123456789abcdef",
+			ALPN:       []string{"nw2"},
+		}); err != nil {
+			t.Fatalf("NewNowhereV2 percent-encoded password: %v", err)
+		}
+		// The next hop obeys the same rule.
+		_, err := IN.NewNowhereV2(&IN.NowhereOption{
+			BaseOption: IN.BaseOption{NameStr: "nowhere-test-key", Listen: "127.0.0.1", Port: "0"},
+			Password:   testPassword,
+			ALPN:       []string{"nw2"},
+			Next:       &IN.NowhereNextOption{Server: "origin.example", Port: 2080, Password: "short"},
+		})
+		if err == nil || !strings.Contains(err.Error(), "next: password") {
+			t.Fatalf("NewNowhereV2 next password error = %v, want the shared-key rule", err)
+		}
+	})
+}
+
+func TestNowhereInboundChainMorph(t *testing.T) {
+	on := true
+	originPort := startTestServerConfig(t, LC.NowhereServerV2{
+		Enable:               true,
+		Listen:               "127.0.0.1:0",
+		Password:             testPassword,
+		Certificate:          testCertificate,
+		PrivateKey:           testPrivateKey,
+		ALPN:                 []string{"nw2"},
+		CongestionController: "bbr",
+		Morph:                true,
+	})
+	relayPort, tunnel := startRelayServerOpt(t, originPort, "tcp", "tcp", testNextPin, &on, nil)
+	client := newTestClientOpt(t, relayPort, "tcp", "tcp", &on)
+	testTCPEcho(t, client)
+	testUDPEcho(t, client)
+	assertTunnelUnused(t, tunnel)
+
+	relayUDPPort, tunnelUDP := startRelayServerOpt(t, originPort, "udp", "udp", testNextPin, &on, nil)
+	clientUDP := newTestClientOpt(t, relayUDPPort, "udp", "udp", &on)
+	testTCPEcho(t, clientUDP)
+	testUDPEcho(t, clientUDP)
+	assertTunnelUnused(t, tunnelUDP)
+}
+
+func TestNowhereInboundChainMorphNextOverride(t *testing.T) {
+	originPort := startTestServer(t)
+	off := false
+	on := true
+	relayPort, tunnel := startRelayServerOpt(t, originPort, "tcp", "tcp", testNextPin, &on, &off)
+	client := newTestClientOpt(t, relayPort, "tcp", "tcp", &on)
+	testTCPEcho(t, client)
+	testUDPEcho(t, client)
+	assertTunnelUnused(t, tunnel)
+}

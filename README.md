@@ -9,12 +9,12 @@
   <a href="https://goreportcard.com/report/github.com/MetaCubeX/mihomo">
     <img src="https://goreportcard.com/badge/github.com/MetaCubeX/mihomo?style=flat-square">
   </a>
-  <img src="https://img.shields.io/github/go-mod/go-version/MetaCubeX/mihomo/Alpha?style=flat-square">
-  <a href="https://github.com/MetaCubeX/mihomo/releases">
-    <img src="https://img.shields.io/github/release/MetaCubeX/mihomo/all.svg?style=flat-square">
+  <img src="https://img.shields.io/github/go-mod/go-version/ohmycggk/clash-meta-nw/nw?style=flat-square">
+  <a href="https://github.com/ohmycggk/clash-meta-nw/releases">
+    <img src="https://img.shields.io/github/release/ohmycggk/clash-meta-nw/all.svg?style=flat-square">
   </a>
-  <a href="https://github.com/MetaCubeX/mihomo">
-    <img src="https://img.shields.io/badge/release-Meta-00b4f0?style=flat-square">
+  <a href="https://github.com/ohmycggk/clash-meta-nw/tree/nw">
+    <img src="https://img.shields.io/badge/branch-nw-00b4f0?style=flat-square">
   </a>
 </p>
 
@@ -36,7 +36,7 @@ A web dashboard with first-class support for this project has been created; it c
 
 ## Configration example
 
-Configuration example is located at [/docs/config.yaml](https://github.com/MetaCubeX/mihomo/blob/Alpha/docs/config.yaml).
+Configuration example is located at [/docs/config.yaml](https://github.com/ohmycggk/clash-meta-nw/blob/nw/docs/config.yaml).
 
 ## Docs
 
@@ -47,12 +47,12 @@ Documentation can be found in [mihomo Docs](https://wiki.metacubex.one/).
 Requirements:
 [Go 1.20 or newer](https://go.dev/dl/)
 
-Build mihomo:
+Build clash-meta-nw:
 
 ```shell
-git clone https://github.com/MetaCubeX/mihomo.git
-cd mihomo && go mod download
-go build
+git clone -b nw https://github.com/ohmycggk/clash-meta-nw.git
+cd clash-meta-nw && go mod download
+go build -o clash-meta-nw
 ```
 
 Set go proxy if a connection to GitHub is not possible:
