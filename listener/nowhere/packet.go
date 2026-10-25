@@ -2,22 +2,64 @@ package nowhere
 
 import (
 	stdtls "crypto/tls"
+	"fmt"
 	"net"
+	"os"
+	"runtime"
 	"sync"
 	"time"
 
 	C "github.com/metacubex/mihomo/constant"
+
+	"github.com/metacubex/fswatch"
 )
 
 // newStdTLSKeyPairLoader parses a PEM pair once and hands out the same
 // certificate for every handshake. The vendored Portal performs its own
 // standard-library handshakes, so it cannot use Mihomo's metacubex/tls loader.
+// Like ca.NewTLSKeyPairLoader, the pair accepts inline PEM or file paths:
+// inline parsing runs first, then the pair loads from disk and is reloaded
+// when the files change (certificate renewal rewrites them in place).
 func newStdTLSKeyPairLoader(certificate, privateKey string) (func() (*stdtls.Certificate, error), error) {
-	cert, err := stdtls.X509KeyPair([]byte(certificate), []byte(privateKey))
-	if err != nil {
-		return nil, err
+	cert, inlineErr := stdtls.X509KeyPair([]byte(certificate), []byte(privateKey))
+	if inlineErr == nil {
+		return func() (*stdtls.Certificate, error) {
+			return &cert, nil
+		}, nil
+	}
+
+	certPath := C.Path.Resolve(certificate)
+	keyPath := C.Path.Resolve(privateKey)
+	var loadErr error
+	if !C.Path.IsSafePath(certPath) {
+		loadErr = C.Path.ErrNotSafePath(certPath)
+	} else if !C.Path.IsSafePath(keyPath) {
+		loadErr = C.Path.ErrNotSafePath(keyPath)
+	} else {
+		cert, loadErr = stdtls.LoadX509KeyPair(certPath, keyPath)
+	}
+	if loadErr != nil {
+		return nil, fmt.Errorf("parse certificate failed, maybe format error:%s, or path error: %s", inlineErr.Error(), loadErr.Error())
+	}
+	gcFlag := new(os.File) // tiny (on the order of 16 bytes or less) and pointer-free objects may never run the finalizer, so we choose new an os.File
+	updateMutex := sync.RWMutex{}
+	if watcher, err := fswatch.NewWatcher(fswatch.Options{Path: []string{certPath, keyPath}, Callback: func(path string) {
+		updateMutex.Lock()
+		defer updateMutex.Unlock()
+		if newCert, err := stdtls.LoadX509KeyPair(certPath, keyPath); err == nil {
+			cert = newCert
+		}
+	}}); err == nil {
+		if err = watcher.Start(); err == nil {
+			runtime.SetFinalizer(gcFlag, func(f *os.File) {
+				_ = watcher.Close()
+			})
+		}
 	}
 	return func() (*stdtls.Certificate, error) {
+		defer runtime.KeepAlive(gcFlag)
+		updateMutex.RLock()
+		defer updateMutex.RUnlock()
 		return &cert, nil
 	}, nil
 }

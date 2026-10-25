@@ -190,22 +190,18 @@ func nw3ServerTLSConfigs(config LC.NowhereServer) (*stdtls.Config, *tls.Config, 
 	quicTLSConfig.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 		return quicLoader()
 	}
-	logNowherePortalFingerprint(certificate, privateKey)
+	logNowherePortalFingerprint(stdLoader)
 	return tlsConfig, quicTLSConfig, nil
 }
 
 // logNowherePortalFingerprint prints the leaf certificate SHA-256 so users
 // can obtain a pin= value, matching the reference Portal's startup log.
-func logNowherePortalFingerprint(certificate, privateKey string) {
-	cert, err := stdtls.X509KeyPair([]byte(certificate), []byte(privateKey))
-	if err != nil {
+func logNowherePortalFingerprint(loader func() (*stdtls.Certificate, error)) {
+	cert, err := loader()
+	if err != nil || cert == nil || cert.Leaf == nil {
 		return
 	}
-	leaf := cert.Leaf
-	if leaf == nil {
-		return
-	}
-	log.Infoln("Nowhere[nw3] TLS certificate SHA-256 fingerprint: %s", nwtransport.Nw3LeafCertificateSHA256Hex(leaf.Raw))
+	log.Infoln("Nowhere[nw3] TLS certificate SHA-256 fingerprint: %s", nwtransport.Nw3LeafCertificateSHA256Hex(cert.Leaf.Raw))
 }
 
 func (s *Server) Close() error {
