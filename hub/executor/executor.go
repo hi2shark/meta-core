@@ -30,6 +30,7 @@ import (
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/features"
 	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/listener"
@@ -104,8 +105,13 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateGeneral(cfg.General, true)
 	updateDNS(cfg.DNS, cfg.General.IPv6)
 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
-	//updateListeners(cfg.General, cfg.Listeners, force)
-	//updateTun(cfg.General) // tun should not care "force"
+	// FlClash drives the inbound lifecycle itself (start/stop from the app UI),
+	// so builds for it opt out with -tags no_auto_inbound; CLI users like
+	// OpenClash depend on ApplyConfig to bring the ports and TUN up.
+	if !features.NoAutoInbound {
+		updateListeners(cfg.General, cfg.Listeners, force)
+		updateTun(cfg.General) // tun should not care "force"
+	}
 	updateIPTables(cfg)
 	updateTunnels(cfg.Tunnels)
 
