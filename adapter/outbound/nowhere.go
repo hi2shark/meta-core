@@ -59,13 +59,19 @@ func (n *Nowhere) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 	if err != nil {
 		return nil, err
 	}
-	return NewPacketConn(N.NewThreadSafePacketConn(&nw3UDPPacketConn{Conn: pc}), n), nil
+	return NewPacketConn(N.NewThreadSafePacketConn(newNw3UDPPacketConn(pc, metadata, target)), n), nil
+}
+
+// newNw3UDPPacketConn binds the address ReadFrom reports exactly once, at dial
+// time, so the read path never has to touch the metadata again.
+func newNw3UDPPacketConn(pc net.Conn, metadata *C.Metadata, target nwtransport.Nw3Target) *nw3UDPPacketConn {
+	return &nw3UDPPacketConn{Conn: pc, remote: nw3ReadAddr(metadata, target)}
 }
 
 // nw3UDPPacketConn presents the vendored Vector's connected datagram socket
 // (one Read/Write moves exactly one payload) as a net.PacketConn, so Mihomo's
 // packet machinery can drive it. The flow is bound to a single target, so
-// ReadFrom always reports that target and WriteTo ignores the address.
+// ReadFrom always reports that flow's address and WriteTo ignores the address.
 type nw3UDPPacketConn struct {
 	net.Conn
 	remote net.Addr
@@ -74,6 +80,22 @@ type nw3UDPPacketConn struct {
 func (c *nw3UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	n, err := c.Conn.Read(p)
 	return n, c.remote, err
+}
+
+// nw3ReadAddr is the address every successful ReadFrom reports. Mihomo's tunnel
+// demands a *net.UDPAddr here: a nil net.Addr makes handleUDPToLocal fall back
+// to the NAT key and log "wrongly implemented server" for every single
+// datagram. The dial address is what that NAT key and the write-back expect, so
+// a domain target reports the IP the flow was actually dialled to rather than
+// the unresolved name.
+func nw3ReadAddr(metadata *C.Metadata, target nwtransport.Nw3Target) *net.UDPAddr {
+	if metadata != nil && metadata.DstIP.IsValid() {
+		return net.UDPAddrFromAddrPort(metadata.AddrPort())
+	}
+	if target.Addr.IsValid() {
+		return net.UDPAddrFromAddrPort(netip.AddrPortFrom(target.Addr, target.Port))
+	}
+	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(netip.IPv4Unspecified(), target.Port))
 }
 
 func (c *nw3UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
